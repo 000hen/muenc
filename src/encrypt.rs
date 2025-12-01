@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, File},
+    fs,
     io::{Read, Write},
 };
 
@@ -13,7 +13,7 @@ use openssl::{
 
 use crate::{
     consts::{AES_KEY_SIZE, CHUNK_SIZE, IV_SIZE},
-    utils::{print_process, write_magic_number},
+    utils::{check_is_stdin, create_file_streams, print_process, write_magic_number},
 };
 
 pub fn encrypt_file(file_path: &str, output_path: &str, public_key_path: &str) {
@@ -30,19 +30,25 @@ pub fn encrypt_file(file_path: &str, output_path: &str, public_key_path: &str) {
     let mut encrypter = Crypter::new(cipher, Mode::Encrypt, &random_key, Some(&iv))
         .expect("Failed to create encrypter");
 
-    let mut file = File::open(file_path).expect("Failed to open input file");
-    let mut output_file =
-        File::create(output_path).expect("Failed to create output encrypted file");
+    let (mut file, mut output_file) = create_file_streams(file_path, output_path);
 
     write_magic_number(&mut output_file);
     write_first_block(&mut output_file, &encrypted_key, &iv);
 
     let mut buffer = [0u8; CHUNK_SIZE];
 
-    let file_size = file.metadata().expect("Failed to get file metadata").len() as usize;
     let mut encrypted_size: usize = 0;
+    let file_size = if check_is_stdin(file_path) {
+        None
+    } else {
+        let size = fs::metadata(file_path)
+            .expect("Failed to get file metadata")
+            .len() as usize;
 
-    println!("Starting encryption of file: {}", file_path);
+        Some(size)
+    };
+
+    eprintln!("Starting encryption of file: {}", file_path);
     loop {
         let readed = file
             .read(&mut buffer)
@@ -53,7 +59,9 @@ pub fn encrypt_file(file_path: &str, output_path: &str, public_key_path: &str) {
         }
 
         encrypted_size += readed;
-        print_process(encrypted_size, file_size);
+        if let Some(total_size) = file_size {
+            print_process(encrypted_size, total_size);
+        }
 
         let mut encrypted_chunk = vec![0u8; readed + cipher.block_size()];
         let count = encrypter
@@ -64,7 +72,7 @@ pub fn encrypt_file(file_path: &str, output_path: &str, public_key_path: &str) {
             .write_all(&encrypted_chunk[..count])
             .expect("Failed to write encrypted chunk to output file");
     }
-    println!();
+    eprintln!();
 
     let mut final_chunk = vec![0u8; cipher.block_size()];
     let count = encrypter
@@ -87,7 +95,7 @@ pub fn encrypt_file(file_path: &str, output_path: &str, public_key_path: &str) {
         .expect("Failed to write authentication tag to output file");
 
     output_file.flush().expect("Failed to flush output file");
-    println!(
+    eprintln!(
         "Encryption completed. Encrypted file saved to: {}",
         output_path
     );

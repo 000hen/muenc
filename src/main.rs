@@ -17,7 +17,7 @@ fn main() {
             execute_command(args);
         }
         None => {
-            println!("No command provided. Use --help for more information.");
+            eprintln!("No command provided. Use --help for more information.");
         }
     }
 }

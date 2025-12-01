@@ -47,7 +47,11 @@ pub enum Commands {
         #[arg(short, long, help = "Path to the private key file used for decryption")]
         key: String,
 
-        #[arg(short, long, help = "Passphrase for the private key, if it is encrypted")]
+        #[arg(
+            short,
+            long,
+            help = "Passphrase for the private key, if it is encrypted"
+        )]
         passphrase: Option<String>,
     },
 }

@@ -6,7 +6,7 @@ use openssl::{pkey::PKey, rsa::Rsa, symm::Cipher};
 use crate::consts::RSA_KEY_SIZE;
 
 pub fn generate_keypair(output: &str, passphrase: Option<&str>) {
-    println!("Generating keypair...");
+    eprintln!("Generating keypair...");
 
     let rsa = Rsa::generate(RSA_KEY_SIZE as u32).expect("Failed to generate RSA keypair");
     let pkey = PKey::from_rsa(rsa.clone()).expect("Failed to create PKey from RSA");
@@ -35,11 +35,11 @@ pub fn generate_keypair(output: &str, passphrase: Option<&str>) {
     fs::write(&private_key_path, &private_key_bytes).expect("Failed to write private key to file");
     fs::write(&public_key_path, &public_key_pem).expect("Failed to write public key to file");
 
-    println!("Keypair generated and saved to {}", output_path.display());
-    println!("=============================");
-    println!();
-    println!("PLEASE KEEP YOUR PRIVATE KEY SAFE!");
-    println!("If you lose it, you will not be able to decrypt your files.");
-    println!();
-    println!("=============================");
+    eprintln!("Keypair generated and saved to {}", output_path.display());
+    eprintln!("=============================");
+    eprintln!();
+    eprintln!("PLEASE KEEP YOUR PRIVATE KEY SAFE!");
+    eprintln!("If you lose it, you will not be able to decrypt your files.");
+    eprintln!();
+    eprintln!("=============================");
 }
