@@ -6,8 +6,10 @@ edition = "2024"
 [dependencies]
 clap = { version = "4.5.53", features = ["derive"] }
 openssl = { version = "0.10.75", features = ["vendored"] }
+rpassword = "7.4.0"
+thiserror = "2.0.17"
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
