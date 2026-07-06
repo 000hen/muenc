@@ -1,7 +1,8 @@
 [package]
-name = "file_encryption"
-version = "0.1.0"
+name = "muenc"
+version = "0.2.0"
 edition = "2024"
+repository = "https://github.com/000hen/muenc"
 
 [dependencies]
 clap = { version = "4.5.53", features = ["derive"] }

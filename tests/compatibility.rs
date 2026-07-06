@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use file_encryption::{
+use muenc::{
     AppError,
     application::EncryptionService,
     crypto::{Algorithm, suite_for_algorithm},
@@ -27,7 +27,7 @@ struct TestDirectory(PathBuf);
 impl TestDirectory {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "file-encryption-tests-{}-{}",
+            "muenc-tests-{}-{}",
             std::process::id(),
             TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));

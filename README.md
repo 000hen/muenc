@@ -1,4 +1,4 @@
-# file_encryption
+# muenc
 
 A command-line tool for streaming authenticated file encryption with versioned, self-describing algorithm metadata.
 
@@ -20,6 +20,8 @@ A command-line tool for streaming authenticated file encryption with versioned, 
 cargo build --release
 ```
 
+This produces the `muenc` binary (`target\release\muenc.exe` on Windows).
+
 The project currently uses vendored OpenSSL. On Windows, ensure a native Windows Perl (for example Strawberry Perl) appears before MSYS Perl in `PATH` when compiling OpenSSL.
 
 ## Usage
@@ -27,13 +29,13 @@ The project currently uses vendored OpenSSL. On Windows, ensure a native Windows
 Generate a key pair:
 
 ```powershell
-cargo run -- generate --output keys
+muenc generate --output keys
 ```
 
 RSA/AES remains the generation default for CLI compatibility. Select the modern X25519/ChaCha20 suite with:
 
 ```powershell
-cargo run -- generate --output keys --algorithm x25519-chacha20-poly1305
+muenc generate --output keys --algorithm x25519-chacha20-poly1305
 ```
 
 The program securely prompts for a private-key passphrase. Press Enter at the first prompt to create an unencrypted private key; otherwise, enter it again for confirmation.
@@ -41,7 +43,7 @@ The program securely prompts for a private-key passphrase. Press Enter at the fi
 Encrypt a file:
 
 ```powershell
-cargo run -- encrypt --input plain.txt --key keys\public_key.pem
+muenc encrypt --input plain.txt --key keys\public_key.pem
 ```
 
 The default output is `plain.txt.enc`. Use `--output -` for stdout or `--input -` for stdin.
@@ -49,12 +51,12 @@ The default output is `plain.txt.enc`. Use `--output -` for stdout or `--input -
 Decrypt a file:
 
 ```powershell
-cargo run -- decrypt --input plain.txt.enc --key keys\private_key.pem
+muenc decrypt --input plain.txt.enc --key keys\private_key.pem
 ```
 
 The program inspects the private key. An unencrypted key needs no input; an encrypted key triggers a hidden passphrase prompt. The default output removes `.enc`, or appends `.dec` if that suffix is absent.
 
-Run `cargo run -- --help` or add `--help` after a subcommand for all options.
+Run `muenc --help` or add `--help` after a subcommand for all options.
 
 The public key determines the encryption suite; no algorithm argument is required for encryption. The versioned encrypted-file header determines the suite during decryption.
 

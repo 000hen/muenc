@@ -10,7 +10,7 @@ use crate::{
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "file_encryption",
+    name = "muenc",
     about = "Stream files through authenticated public-key encryption",
     version,
     author,
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn generate_defaults_to_the_current_directory() {
-        let cli = Cli::try_parse_from(["file_encryption", "generate"]).unwrap();
+        let cli = Cli::try_parse_from(["muenc", "generate"]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Generate { output, algorithm: AlgorithmChoice::RsaAes256Gcm }
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn x25519_algorithm_can_be_selected_for_generation() {
         let cli = Cli::try_parse_from([
-            "file_encryption",
+            "muenc",
             "generate",
             "--algorithm",
             "x25519-chacha20-poly1305",
@@ -160,13 +160,8 @@ mod tests {
 
     #[test]
     fn generate_rejects_passphrases_on_the_command_line() {
-        let error = Cli::try_parse_from([
-            "file_encryption",
-            "generate",
-            "--passphrase",
-            "leaked-secret",
-        ])
-        .unwrap_err();
+        let error = Cli::try_parse_from(["muenc", "generate", "--passphrase", "leaked-secret"])
+            .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::UnknownArgument);
     }
@@ -174,7 +169,7 @@ mod tests {
     #[test]
     fn decrypt_rejects_passphrases_on_the_command_line() {
         let error = Cli::try_parse_from([
-            "file_encryption",
+            "muenc",
             "decrypt",
             "--input",
             "data.enc",
@@ -190,7 +185,7 @@ mod tests {
 
     #[test]
     fn a_subcommand_is_required() {
-        let error = Cli::try_parse_from(["file_encryption"]).unwrap_err();
+        let error = Cli::try_parse_from(["muenc"]).unwrap_err();
         assert_eq!(
             error.kind(),
             ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand

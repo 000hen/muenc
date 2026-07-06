@@ -61,12 +61,12 @@ impl TransactionalOutput {
                 .to_path_buf()
         };
         let stem = if is_stdio(destination) {
-            "file-encryption-stdout".to_string()
+            "muenc-stdout".to_string()
         } else {
             destination
                 .file_name()
                 .and_then(|name| name.to_str())
-                .unwrap_or("file-encryption-output")
+                .unwrap_or("muenc-output")
                 .to_string()
         };
 
@@ -243,7 +243,7 @@ mod tests {
     impl TestDirectory {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
-                "file-encryption-io-unit-{}-{}",
+                "muenc-io-unit-{}-{}",
                 std::process::id(),
                 DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
