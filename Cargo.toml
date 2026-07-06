@@ -5,10 +5,10 @@ edition = "2024"
 repository = "https://github.com/000hen/muenc"
 
 [dependencies]
-clap = { version = "4.5.53", features = ["derive"] }
-openssl = { version = "0.10.75", features = ["vendored"] }
-rpassword = "7.4.0"
-thiserror = "2.0.17"
+clap = { version = "4.6.1", features = ["derive"] }
+openssl = { version = "0.10.81", features = ["vendored"] }
+rpassword = "7.5.4"
+thiserror = "2.0.18"
 
 [profile.release]
 opt-level = 3
