@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, BufReader, BufWriter, Read, Write},
+    io::{self, BufReader, BufWriter, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
@@ -200,16 +200,22 @@ pub struct Progress {
     total: Option<u64>,
     processed: u64,
     last_draw: Instant,
+    terminal: bool,
+    active: bool,
 }
 
 impl Progress {
     pub fn new(label: &'static str, total: Option<u64>) -> Self {
-        Self {
+        let progress = Self {
             label,
             total,
             processed: 0,
             last_draw: Instant::now(),
-        }
+            terminal: io::stderr().is_terminal(),
+            active: true,
+        };
+        progress.draw();
+        progress
     }
 
     pub fn advance(&mut self, amount: usize) {
@@ -220,24 +226,68 @@ impl Progress {
         }
     }
 
-    pub fn finish(&self) {
+    pub fn finish(mut self) {
         self.draw();
-        eprintln!();
+        let stderr = io::stderr();
+        let mut stderr = stderr.lock();
+        let _ = writeln!(stderr);
+        if self.terminal {
+            let _ = write_osc_progress(&mut stderr, 0, 0);
+        }
+        let _ = stderr.flush();
+        self.active = false;
     }
 
     fn draw(&self) {
-        match self.total {
-            Some(0) | None => eprint!("\r{}: {} bytes", self.label, self.processed),
-            Some(total) => eprint!(
-                "\r{}: {}/{} bytes ({:.1}%)",
-                self.label,
-                self.processed,
-                total,
-                self.processed as f64 * 100.0 / total as f64
-            ),
+        let stderr = io::stderr();
+        let mut stderr = stderr.lock();
+        if self.terminal {
+            let (state, percentage) = terminal_progress(self.total, self.processed);
+            let _ = write_osc_progress(&mut stderr, state, percentage);
         }
-        let _ = io::stderr().flush();
+        match self.total {
+            Some(0) | None => {
+                let _ = write!(stderr, "\r{}: {} bytes", self.label, self.processed);
+            }
+            Some(total) => {
+                let _ = write!(
+                    stderr,
+                    "\r{}: {}/{} bytes ({:.1}%)",
+                    self.label,
+                    self.processed,
+                    total,
+                    self.processed as f64 * 100.0 / total as f64
+                );
+            }
+        }
+        let _ = stderr.flush();
     }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        if self.active && self.terminal {
+            let stderr = io::stderr();
+            let mut stderr = stderr.lock();
+            let _ = write_osc_progress(&mut stderr, 0, 0);
+            let _ = stderr.flush();
+        }
+    }
+}
+
+fn terminal_progress(total: Option<u64>, processed: u64) -> (u8, u8) {
+    match total {
+        Some(0) => (1, 0),
+        Some(total) => {
+            let percentage = ((processed.min(total) as u128 * 100) / total as u128) as u8;
+            (1, percentage)
+        }
+        None => (4, 0),
+    }
+}
+
+fn write_osc_progress(writer: &mut dyn Write, state: u8, percentage: u8) -> io::Result<()> {
+    write!(writer, "\x1b]9;4;{state};{percentage}\x07")
 }
 
 #[cfg(test)]
@@ -283,6 +333,24 @@ mod tests {
         assert!(is_stdio(Path::new("stdio")));
         assert!(is_stdio(Path::new("STDIO")));
         assert!(!is_stdio(Path::new("ordinary-file")));
+    }
+
+    #[test]
+    fn terminal_progress_uses_percentages_for_sized_inputs() {
+        assert_eq!(terminal_progress(Some(400), 100), (1, 25));
+        assert_eq!(terminal_progress(Some(400), 500), (1, 100));
+    }
+
+    #[test]
+    fn terminal_progress_uses_state_four_for_stdio() {
+        assert_eq!(terminal_progress(None, 1024), (4, 0));
+    }
+
+    #[test]
+    fn osc_progress_uses_the_bell_terminated_sequence() {
+        let mut output = Vec::new();
+        write_osc_progress(&mut output, 1, 25).unwrap();
+        assert_eq!(output, b"\x1b]9;4;1;25\x07");
     }
 
     #[test]
