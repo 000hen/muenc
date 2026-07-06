@@ -52,6 +52,15 @@ pub struct TransactionalOutput {
 
 impl TransactionalOutput {
     pub fn new(destination: &Path) -> Result<Self> {
+        Self::new_with_sensitivity(destination, false)
+    }
+
+    /// Creates an output whose temporary file is private from the moment it is opened.
+    pub fn new_private(destination: &Path) -> Result<Self> {
+        Self::new_with_sensitivity(destination, true)
+    }
+
+    fn new_with_sensitivity(destination: &Path, private: bool) -> Result<Self> {
         let parent = if is_stdio(destination) {
             std::env::temp_dir()
         } else {
@@ -74,11 +83,17 @@ impl TransactionalOutput {
             let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let temporary_path =
                 parent.join(format!(".{stem}.{}.{}.tmp", std::process::id(), sequence));
-            match OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temporary_path)
-            {
+            let mut options = OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            if private {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            #[cfg(not(unix))]
+            let _ = private;
+
+            match options.open(&temporary_path) {
                 Ok(file) => {
                     return Ok(Self {
                         destination: destination.to_path_buf(),
@@ -294,5 +309,26 @@ mod tests {
         }
 
         assert_eq!(fs::read(destination).unwrap(), b"known-good result");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_output_is_never_accessible_to_other_users() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new();
+        let destination = directory.path("private_key.pem");
+        let mut output = TransactionalOutput::new_private(&destination).unwrap();
+        let temporary_mode = fs::metadata(&output.temporary_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(temporary_mode, 0o600);
+
+        output.write_all(b"private key").unwrap();
+        output.commit().unwrap();
+        let published_mode = fs::metadata(destination).unwrap().permissions().mode() & 0o777;
+        assert_eq!(published_mode, 0o600);
     }
 }

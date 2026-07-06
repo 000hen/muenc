@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
 };
@@ -17,6 +17,9 @@ use crate::{
 };
 
 const STREAM_BUFFER_SIZE: usize = 1024 * 1024;
+const DEFAULT_KEY_DIRECTORY: &str = ".muenc";
+const PRIVATE_KEY_FILE: &str = "private_key.pem";
+const PUBLIC_KEY_FILE: &str = "public_key.pem";
 
 #[derive(Default)]
 pub struct EncryptionService;
@@ -36,10 +39,10 @@ impl EncryptionService {
             AppError::io("create the key output directory", output_directory, error)
         })?;
         let keypair = suite_for_algorithm(algorithm).generate_keypair(passphrase)?;
-        let private_path = output_directory.join("private_key.pem");
-        let public_path = output_directory.join("public_key.pem");
+        let private_path = output_directory.join(PRIVATE_KEY_FILE);
+        let public_path = output_directory.join(PUBLIC_KEY_FILE);
 
-        let mut private_output = TransactionalOutput::new(&private_path)?;
+        let mut private_output = TransactionalOutput::new_private(&private_path)?;
         let mut public_output = TransactionalOutput::new(&public_path)?;
         write_output(&mut private_output, &keypair.private_key_pem, &private_path)?;
         write_output(&mut public_output, &keypair.public_key_pem, &public_path)?;
@@ -295,6 +298,62 @@ pub fn default_encrypted_path(input: &Path) -> PathBuf {
     PathBuf::from(format!("{}.enc", input.display()))
 }
 
+pub fn default_key_directory() -> Result<PathBuf> {
+    home_directory()
+        .map(|home| key_directory_in(&home))
+        .ok_or(AppError::HomeDirectoryUnavailable)
+}
+
+pub fn default_public_key_path() -> Result<PathBuf> {
+    Ok(public_key_path(&default_key_directory()?))
+}
+
+pub fn default_private_key_path() -> Result<PathBuf> {
+    Ok(private_key_path(&default_key_directory()?))
+}
+
+pub fn keypair_exists(directory: &Path) -> bool {
+    public_key_path(directory).exists() || private_key_path(directory).exists()
+}
+
+fn key_directory_in(home: &Path) -> PathBuf {
+    home.join(DEFAULT_KEY_DIRECTORY)
+}
+
+fn public_key_path(directory: &Path) -> PathBuf {
+    directory.join(PUBLIC_KEY_FILE)
+}
+
+fn private_key_path(directory: &Path) -> PathBuf {
+    directory.join(PRIVATE_KEY_FILE)
+}
+
+#[cfg(windows)]
+fn home_directory() -> Option<PathBuf> {
+    env::var_os("USERPROFILE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let drive = env::var_os("HOMEDRIVE").filter(|value| !value.is_empty())?;
+            let path = env::var_os("HOMEPATH").filter(|value| !value.is_empty())?;
+            let mut home = PathBuf::from(drive);
+            home.push(path);
+            Some(home)
+        })
+        .or_else(|| {
+            env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+}
+
+#[cfg(not(windows))]
+fn home_directory() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 pub fn default_decrypted_path(input: &Path) -> PathBuf {
     match input.to_string_lossy().strip_suffix(".enc") {
         Some(path) => PathBuf::from(path),
@@ -328,5 +387,30 @@ mod tests {
             default_decrypted_path(Path::new("archive.bin")),
             PathBuf::from("archive.bin.dec")
         );
+    }
+
+    #[test]
+    fn default_keys_are_stored_in_a_hidden_home_directory() {
+        let directory = key_directory_in(Path::new("home"));
+        assert_eq!(directory, Path::new("home").join(DEFAULT_KEY_DIRECTORY));
+        assert_eq!(public_key_path(&directory), directory.join(PUBLIC_KEY_FILE));
+        assert_eq!(
+            private_key_path(&directory),
+            directory.join(PRIVATE_KEY_FILE)
+        );
+    }
+
+    #[test]
+    fn either_key_file_marks_a_keypair_as_existing() {
+        let directory =
+            std::env::temp_dir().join(format!("muenc-key-existence-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+
+        assert!(!keypair_exists(&directory));
+        fs::write(directory.join(PRIVATE_KEY_FILE), b"private").unwrap();
+        assert!(keypair_exists(&directory));
+
+        fs::remove_dir_all(directory).unwrap();
     }
 }

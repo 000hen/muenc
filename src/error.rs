@@ -58,6 +58,12 @@ pub enum AppError {
 
     #[error("could not read a passphrase: {0}")]
     PassphraseInput(#[source] io::Error),
+
+    #[error("could not determine the home directory; specify a key path explicitly")]
+    HomeDirectoryUnavailable,
+
+    #[error("key files already exist in '{}'; use --force to overwrite them", .0.display())]
+    KeypairAlreadyExists(PathBuf),
 }
 
 impl AppError {

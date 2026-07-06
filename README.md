@@ -32,6 +32,11 @@ Generate a key pair:
 muenc generate --output keys
 ```
 
+If `--output` is omitted, keys are stored in `~/.muenc`. On Unix, the private
+key is created with mode `0600`. Existing keys are preserved unless replacement
+is explicitly authorized with `--force`; replacing a private key can make data
+encrypted with the old key unrecoverable.
+
 RSA/AES remains the generation default for CLI compatibility. Select the modern X25519/ChaCha20 suite with:
 
 ```powershell
@@ -46,6 +51,8 @@ Encrypt a file:
 muenc encrypt --input plain.txt --key keys\public_key.pem
 ```
 
+If `--key` is omitted, encryption uses `~/.muenc/public_key.pem`.
+
 The default output is `plain.txt.enc`. Use `--output -` for stdout or `--input -` for stdin.
 
 Decrypt a file:
@@ -53,6 +60,8 @@ Decrypt a file:
 ```powershell
 muenc decrypt --input plain.txt.enc --key keys\private_key.pem
 ```
+
+If `--key` is omitted, decryption uses `~/.muenc/private_key.pem`.
 
 The program inspects the private key. An unencrypted key needs no input; an encrypted key triggers a hidden passphrase prompt. The default output removes `.enc`, or appends `.dec` if that suffix is absent.
 
