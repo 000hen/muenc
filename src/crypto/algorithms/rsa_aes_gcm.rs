@@ -1,3 +1,5 @@
+use std::io::Read;
+
 use openssl::{
     encrypt::{Decrypter, Encrypter},
     hash::MessageDigest,
@@ -7,36 +9,27 @@ use openssl::{
     symm::Cipher,
 };
 
-use crate::{AppError, Result};
+use crate::{AppError, Result, file_format::FileHeader};
 
 use super::super::{
-    AlgorithmDetails, DATA_KEY_SIZE, Encapsulation, EncryptionSuite, KeyPair, KeyProtection,
-    StreamDecryptor, StreamEncryptor,
-    key_utils::{detect_key_protection, load_private_key},
-    openssl_stream,
+    AlgorithmDetails, DATA_KEY_SIZE, DecryptionSession, Encapsulation, EncryptionMethod,
+    EncryptionSession, KeyPair, KeyPairGenerator, key_utils::load_private_key,
 };
 
 pub const KEY_ESTABLISHMENT_ID: u16 = 1;
 pub const DATA_CIPHER_ID: u16 = 1;
 const RSA_KEY_BITS: u32 = 2048;
 const NONCE_SIZE: usize = 12;
-const TAG_SIZE: usize = 16;
 
 #[derive(Default)]
 pub struct RsaAes256Gcm;
 
-impl EncryptionSuite for RsaAes256Gcm {
-    fn name(&self) -> &'static str {
-        "RSA-OAEP-SHA256 + AES-256-GCM"
-    }
+const DETAILS: AlgorithmDetails = AlgorithmDetails {
+    key_establishment: KEY_ESTABLISHMENT_ID,
+    data_cipher: DATA_CIPHER_ID,
+};
 
-    fn details(&self) -> AlgorithmDetails {
-        AlgorithmDetails {
-            key_establishment: KEY_ESTABLISHMENT_ID,
-            data_cipher: DATA_CIPHER_ID,
-        }
-    }
-
+impl KeyPairGenerator for RsaAes256Gcm {
     fn generate_keypair(&self, passphrase: Option<&[u8]>) -> Result<KeyPair> {
         let rsa = Rsa::generate(RSA_KEY_BITS)
             .map_err(|error| AppError::crypto("generating the RSA key pair", error))?;
@@ -58,11 +51,9 @@ impl EncryptionSuite for RsaAes256Gcm {
             public_key_pem,
         })
     }
+}
 
-    fn key_protection(&self, private_key_pem: &[u8]) -> KeyProtection {
-        detect_key_protection(private_key_pem)
-    }
-
+impl RsaAes256Gcm {
     fn encapsulate(&self, public_key_pem: &[u8]) -> Result<Encapsulation> {
         let public_key =
             PKey::public_key_from_pem(public_key_pem).map_err(|_| AppError::InvalidPublicKey)?;
@@ -120,70 +111,27 @@ impl EncryptionSuite for RsaAes256Gcm {
         }
         Ok(data_key)
     }
+}
 
-    fn decapsulate_legacy(
-        &self,
-        private_key_pem: &[u8],
-        passphrase: Option<&[u8]>,
-        key_material: &[u8],
-    ) -> Result<Vec<u8>> {
-        let private_key = load_private_key(private_key_pem, passphrase, Id::RSA, "RSA")?;
-        let rsa = private_key
-            .rsa()
-            .map_err(|error| AppError::crypto("reading the RSA private key", error))?;
-        let mut data_key = vec![0_u8; rsa.size() as usize];
-        let written = rsa
-            .private_decrypt(key_material, &mut data_key, Padding::PKCS1_OAEP)
-            .map_err(|_| AppError::AuthenticationFailed)?;
-        data_key.truncate(written);
-        if data_key.len() != DATA_KEY_SIZE {
-            return Err(AppError::AuthenticationFailed);
-        }
-        Ok(data_key)
-    }
-
-    fn legacy_key_material_len(
-        &self,
-        private_key_pem: &[u8],
-        passphrase: Option<&[u8]>,
-    ) -> Result<usize> {
-        Ok(load_private_key(private_key_pem, passphrase, Id::RSA, "RSA")?.size())
-    }
-
-    fn nonce_size(&self) -> usize {
-        NONCE_SIZE
-    }
-
-    fn tag_size(&self) -> usize {
-        TAG_SIZE
-    }
-
-    fn random_nonce(&self) -> Result<Vec<u8>> {
-        let mut nonce = vec![0_u8; NONCE_SIZE];
-        rand::rand_bytes(&mut nonce)
-            .map_err(|error| AppError::crypto("generating the AES-GCM nonce", error))?;
-        Ok(nonce)
-    }
-
-    fn encryptor(&self, data_key: &[u8], nonce: &[u8]) -> Result<Box<dyn StreamEncryptor>> {
-        openssl_stream::encryptor(
+impl EncryptionMethod for RsaAes256Gcm {
+    fn prepare_encryption(&self, public_key_pem: &[u8]) -> Result<EncryptionSession> {
+        EncryptionSession::versioned(
+            DETAILS,
             Cipher::aes_256_gcm(),
-            data_key,
-            nonce,
-            "initializing AES-256-GCM encryption",
+            NONCE_SIZE,
+            self.encapsulate(public_key_pem)?,
         )
     }
 
-    fn decryptor(&self, data_key: &[u8], nonce: &[u8]) -> Result<Box<dyn StreamDecryptor>> {
-        openssl_stream::decryptor(
-            Cipher::aes_256_gcm(),
-            data_key,
-            nonce,
-            "initializing AES-256-GCM decryption",
-        )
-    }
-
-    fn block_size(&self) -> usize {
-        Cipher::aes_256_gcm().block_size()
+    fn prepare_decryption(
+        &self,
+        _reader: &mut dyn Read,
+        header: FileHeader,
+        private_key_pem: &[u8],
+        passphrase: Option<&[u8]>,
+    ) -> Result<DecryptionSession> {
+        let header = header.versioned(DETAILS, NONCE_SIZE, 16)?;
+        let data_key = self.decapsulate(private_key_pem, passphrase, &header.key_material)?;
+        DecryptionSession::versioned(Cipher::aes_256_gcm(), header, &data_key)
     }
 }

@@ -25,6 +25,46 @@ pub enum FormatVersion {
     Version1,
 }
 
+/// Parsed framing before any method-specific private-key operation.
+pub enum FileHeader {
+    Legacy,
+    Version1(VersionedHeader),
+}
+
+impl FileHeader {
+    pub(crate) fn versioned(
+        self,
+        details: AlgorithmDetails,
+        nonce_size: usize,
+        tag_size: usize,
+    ) -> Result<VersionedHeader> {
+        let Self::Version1(header) = self else {
+            return Err(AppError::InvalidFormat(
+                "method requires a version-1 header".into(),
+            ));
+        };
+        if header.details != details {
+            return Err(AppError::UnsupportedAlgorithms {
+                key_establishment: header.details.key_establishment,
+                data_cipher: header.details.data_cipher,
+            });
+        }
+        if header.nonce.len() != nonce_size || header.tag_size != tag_size {
+            return Err(AppError::InvalidFormat(format!(
+                "method requires a {nonce_size}-byte nonce and {tag_size}-byte authentication tag"
+            )));
+        }
+        Ok(header)
+    }
+}
+
+pub fn read_header(reader: &mut dyn Read) -> Result<FileHeader> {
+    match read_version(reader)? {
+        FormatVersion::Legacy => Ok(FileHeader::Legacy),
+        FormatVersion::Version1 => Ok(FileHeader::Version1(read_versioned_header(reader)?)),
+    }
+}
+
 pub struct VersionedHeader {
     pub details: AlgorithmDetails,
     pub key_material: Vec<u8>,

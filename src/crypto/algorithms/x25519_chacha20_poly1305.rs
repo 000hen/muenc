@@ -1,43 +1,35 @@
+use std::io::Read;
+
 use openssl::{
     derive::Deriver,
     md::Md,
     pkey::{Id, PKey},
     pkey_ctx::PkeyCtx,
-    rand,
     symm::Cipher,
 };
 
-use crate::{AppError, Result};
+use crate::{AppError, Result, file_format::FileHeader};
 
 use super::super::{
-    AlgorithmDetails, DATA_KEY_SIZE, Encapsulation, EncryptionSuite, KeyPair, KeyProtection,
-    StreamDecryptor, StreamEncryptor,
-    key_utils::{detect_key_protection, load_private_key},
-    openssl_stream,
+    AlgorithmDetails, DATA_KEY_SIZE, DecryptionSession, Encapsulation, EncryptionMethod,
+    EncryptionSession, KeyPair, KeyPairGenerator, key_utils::load_private_key,
 };
 
 pub const KEY_ESTABLISHMENT_ID: u16 = 2;
 pub const DATA_CIPHER_ID: u16 = 2;
 const NONCE_SIZE: usize = 12;
-const TAG_SIZE: usize = 16;
 const PUBLIC_KEY_SIZE: usize = 32;
 const HKDF_SALT: &[u8] = b"MUENC-X25519-HKDF-SHA256-v1";
 
 #[derive(Default)]
 pub struct X25519ChaCha20Poly1305;
 
-impl EncryptionSuite for X25519ChaCha20Poly1305 {
-    fn name(&self) -> &'static str {
-        "X25519-HKDF-SHA256 + ChaCha20-Poly1305"
-    }
+const DETAILS: AlgorithmDetails = AlgorithmDetails {
+    key_establishment: KEY_ESTABLISHMENT_ID,
+    data_cipher: DATA_CIPHER_ID,
+};
 
-    fn details(&self) -> AlgorithmDetails {
-        AlgorithmDetails {
-            key_establishment: KEY_ESTABLISHMENT_ID,
-            data_cipher: DATA_CIPHER_ID,
-        }
-    }
-
+impl KeyPairGenerator for X25519ChaCha20Poly1305 {
     fn generate_keypair(&self, passphrase: Option<&[u8]>) -> Result<KeyPair> {
         let key = PKey::generate_x25519()
             .map_err(|error| AppError::crypto("generating the X25519 key pair", error))?;
@@ -57,11 +49,9 @@ impl EncryptionSuite for X25519ChaCha20Poly1305 {
             public_key_pem,
         })
     }
+}
 
-    fn key_protection(&self, private_key_pem: &[u8]) -> KeyProtection {
-        detect_key_protection(private_key_pem)
-    }
-
+impl X25519ChaCha20Poly1305 {
     fn encapsulate(&self, public_key_pem: &[u8]) -> Result<Encapsulation> {
         let recipient =
             PKey::public_key_from_pem(public_key_pem).map_err(|_| AppError::InvalidPublicKey)?;
@@ -104,42 +94,28 @@ impl EncryptionSuite for X25519ChaCha20Poly1305 {
         let shared = derive_shared_secret(&recipient, &ephemeral)?;
         derive_data_key(&shared, key_material, &recipient_public)
     }
+}
 
-    fn nonce_size(&self) -> usize {
-        NONCE_SIZE
-    }
-
-    fn tag_size(&self) -> usize {
-        TAG_SIZE
-    }
-
-    fn random_nonce(&self) -> Result<Vec<u8>> {
-        let mut nonce = vec![0_u8; NONCE_SIZE];
-        rand::rand_bytes(&mut nonce)
-            .map_err(|error| AppError::crypto("generating the ChaCha20 nonce", error))?;
-        Ok(nonce)
-    }
-
-    fn encryptor(&self, data_key: &[u8], nonce: &[u8]) -> Result<Box<dyn StreamEncryptor>> {
-        openssl_stream::encryptor(
+impl EncryptionMethod for X25519ChaCha20Poly1305 {
+    fn prepare_encryption(&self, public_key_pem: &[u8]) -> Result<EncryptionSession> {
+        EncryptionSession::versioned(
+            DETAILS,
             Cipher::chacha20_poly1305(),
-            data_key,
-            nonce,
-            "initializing ChaCha20-Poly1305 encryption",
+            NONCE_SIZE,
+            self.encapsulate(public_key_pem)?,
         )
     }
 
-    fn decryptor(&self, data_key: &[u8], nonce: &[u8]) -> Result<Box<dyn StreamDecryptor>> {
-        openssl_stream::decryptor(
-            Cipher::chacha20_poly1305(),
-            data_key,
-            nonce,
-            "initializing ChaCha20-Poly1305 decryption",
-        )
-    }
-
-    fn block_size(&self) -> usize {
-        Cipher::chacha20_poly1305().block_size()
+    fn prepare_decryption(
+        &self,
+        _reader: &mut dyn Read,
+        header: FileHeader,
+        private_key_pem: &[u8],
+        passphrase: Option<&[u8]>,
+    ) -> Result<DecryptionSession> {
+        let header = header.versioned(DETAILS, NONCE_SIZE, 16)?;
+        let data_key = self.decapsulate(private_key_pem, passphrase, &header.key_material)?;
+        DecryptionSession::versioned(Cipher::chacha20_poly1305(), header, &data_key)
     }
 }
 

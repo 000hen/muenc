@@ -2,10 +2,18 @@ mod algorithms;
 mod key_utils;
 mod openssl_stream;
 mod registry;
+mod session;
 
-use crate::Result;
+use std::io::Read;
 
-pub use registry::{Algorithm, suite_for_algorithm, suite_for_details, suite_for_public_key};
+use crate::{Result, file_format::FileHeader};
+
+pub use key_utils::detect_key_protection;
+pub use registry::{
+    Algorithm, key_generator_for_algorithm, method_for_algorithm, method_for_details,
+    method_for_header, method_for_public_key,
+};
+pub use session::{DecryptionSession, EncryptionSession};
 
 pub const DATA_KEY_SIZE: usize = 32;
 
@@ -46,41 +54,19 @@ pub trait StreamDecryptor {
     fn finalize(&mut self, output: &mut [u8]) -> Result<usize>;
 }
 
-/// A complete key-establishment and authenticated-data-encryption suite.
-/// New algorithms plug in here without changing the application or CLI layers.
-pub trait EncryptionSuite: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn details(&self) -> AlgorithmDetails;
+/// Prepares a complete encryption or decryption stream, including method-specific framing.
+pub trait EncryptionMethod: Send + Sync {
+    fn prepare_encryption(&self, public_key_pem: &[u8]) -> Result<EncryptionSession>;
+    fn prepare_decryption(
+        &self,
+        reader: &mut dyn Read,
+        header: FileHeader,
+        private_key_pem: &[u8],
+        passphrase: Option<&[u8]>,
+    ) -> Result<DecryptionSession>;
+}
+
+/// Key generation is independent of encrypted-file processing.
+pub trait KeyPairGenerator: Send + Sync {
     fn generate_keypair(&self, passphrase: Option<&[u8]>) -> Result<KeyPair>;
-    fn key_protection(&self, private_key_pem: &[u8]) -> KeyProtection;
-    fn encapsulate(&self, public_key_pem: &[u8]) -> Result<Encapsulation>;
-    fn decapsulate(
-        &self,
-        private_key_pem: &[u8],
-        passphrase: Option<&[u8]>,
-        key_material: &[u8],
-    ) -> Result<Vec<u8>>;
-    fn decapsulate_legacy(
-        &self,
-        private_key_pem: &[u8],
-        passphrase: Option<&[u8]>,
-        key_material: &[u8],
-    ) -> Result<Vec<u8>> {
-        self.decapsulate(private_key_pem, passphrase, key_material)
-    }
-    fn legacy_key_material_len(
-        &self,
-        _private_key_pem: &[u8],
-        _passphrase: Option<&[u8]>,
-    ) -> Result<usize> {
-        Err(crate::AppError::InvalidFormat(
-            "selected algorithm cannot read legacy files".into(),
-        ))
-    }
-    fn nonce_size(&self) -> usize;
-    fn tag_size(&self) -> usize;
-    fn random_nonce(&self) -> Result<Vec<u8>>;
-    fn encryptor(&self, data_key: &[u8], nonce: &[u8]) -> Result<Box<dyn StreamEncryptor>>;
-    fn decryptor(&self, data_key: &[u8], nonce: &[u8]) -> Result<Box<dyn StreamDecryptor>>;
-    fn block_size(&self) -> usize;
 }

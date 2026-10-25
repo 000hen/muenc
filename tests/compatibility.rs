@@ -7,7 +7,7 @@ use std::{
 use muenc::{
     AppError,
     application::EncryptionService,
-    crypto::{Algorithm, suite_for_algorithm},
+    crypto::{Algorithm, key_generator_for_algorithm, method_for_algorithm},
     file_format::{
         CURRENT_VERSION, LEGACY_MAGIC, LEGACY_NONCE_SIZE, LEGACY_TAG_SIZE, MAGIC_PREFIX,
         PREAMBLE_SIZE,
@@ -21,6 +21,76 @@ use openssl::{
 };
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn every_registered_method_encrypts_through_the_same_interface() {
+    for algorithm in [
+        Algorithm::RsaAes256Gcm,
+        Algorithm::X25519ChaCha20Poly1305,
+        Algorithm::LegacyRsaAes256Gcm,
+    ] {
+        let directory = TestDirectory::new();
+        let keys = key_generator_for_algorithm(algorithm)
+            .generate_keypair(None)
+            .unwrap();
+        let private_path = directory.path("private.pem");
+        let encrypted_path = directory.path("input.enc");
+        let output_path = directory.path("output.bin");
+        fs::write(&private_path, &keys.private_key_pem).unwrap();
+
+        for plaintext in [b"".as_slice(), b"common method contract".as_slice()] {
+            let mut session = method_for_algorithm(algorithm)
+                .prepare_encryption(&keys.public_key_pem)
+                .unwrap();
+            let mut encoded = session.header;
+            let mut ciphertext = vec![0; plaintext.len() + session.block_size];
+            let mut count = session
+                .encryptor
+                .update(plaintext, &mut ciphertext)
+                .unwrap();
+            count += session
+                .encryptor
+                .finalize(&mut ciphertext[count..])
+                .unwrap();
+            encoded.extend_from_slice(&ciphertext[..count]);
+            let mut tag = vec![0; session.tag_size];
+            session.encryptor.authentication_tag(&mut tag).unwrap();
+            encoded.extend_from_slice(&tag);
+            fs::write(&encrypted_path, encoded).unwrap();
+
+            EncryptionService::new()
+                .decrypt(
+                    &encrypted_path,
+                    &output_path,
+                    &private_path,
+                    || unreachable!(),
+                )
+                .unwrap();
+            assert_eq!(fs::read(&output_path).unwrap(), plaintext, "{algorithm}");
+        }
+    }
+}
+
+#[test]
+fn modern_methods_reject_shortened_authentication_tags() {
+    for algorithm in [Algorithm::RsaAes256Gcm, Algorithm::X25519ChaCha20Poly1305] {
+        let keys = key_generator_for_algorithm(algorithm)
+            .generate_keypair(None)
+            .unwrap();
+        let method = method_for_algorithm(algorithm);
+        let session = method.prepare_encryption(&keys.public_key_pem).unwrap();
+        let mut header = session.header;
+        // The generic format accepts this length; each method must reject it.
+        header[PREAMBLE_SIZE + 10..PREAMBLE_SIZE + 12].copy_from_slice(&8_u16.to_be_bytes());
+        let mut reader = std::io::Cursor::new(header);
+        let header = muenc::file_format::read_header(&mut reader).unwrap();
+        let error = method
+            .prepare_decryption(&mut reader, header, &keys.private_key_pem, None)
+            .err()
+            .expect("the method must require its full authentication tag");
+        assert!(matches!(error, AppError::InvalidFormat(_)), "{algorithm}");
+    }
+}
 
 struct TestDirectory(PathBuf);
 
@@ -231,10 +301,19 @@ fn authentication_failure_preserves_existing_output() {
 
 #[test]
 fn decrypts_files_written_by_the_legacy_layout() {
+    check_legacy_compatibility(None);
+}
+
+#[test]
+fn legacy_files_support_encrypted_private_keys() {
+    check_legacy_compatibility(Some(b"legacy passphrase"));
+}
+
+fn check_legacy_compatibility(passphrase: Option<&[u8]>) {
     let directory = TestDirectory::new();
-    let suite = suite_for_algorithm(Algorithm::RsaAes256Gcm);
+    let generator = key_generator_for_algorithm(Algorithm::RsaAes256Gcm);
     let service = EncryptionService::new();
-    let keys = suite.generate_keypair(None).unwrap();
+    let keys = generator.generate_keypair(passphrase).unwrap();
     let private_key_path = directory.path("private.pem");
     let encrypted_path = directory.path("legacy.enc");
     let output_path = directory.path("output.bin");
@@ -269,15 +348,30 @@ fn decrypts_files_written_by_the_legacy_layout() {
     legacy_file.extend_from_slice(&nonce);
     legacy_file.extend_from_slice(&ciphertext);
     legacy_file.extend_from_slice(&tag);
-    fs::write(&encrypted_path, legacy_file).unwrap();
+    fs::write(&encrypted_path, &legacy_file).unwrap();
 
+    let mut prompts = 0;
     service
-        .decrypt(
-            &encrypted_path,
-            &output_path,
-            &private_key_path,
-            || unreachable!(),
-        )
+        .decrypt(&encrypted_path, &output_path, &private_key_path, || {
+            prompts += 1;
+            Ok(passphrase
+                .expect("unencrypted keys must not prompt")
+                .to_vec())
+        })
         .unwrap();
-    assert_eq!(fs::read(output_path).unwrap(), plaintext);
+    assert_eq!(prompts, usize::from(passphrase.is_some()));
+    assert_eq!(fs::read(&output_path).unwrap(), plaintext);
+
+    // Legacy authentication failures must also preserve an existing destination.
+    *legacy_file.last_mut().unwrap() ^= 1;
+    fs::write(&encrypted_path, legacy_file).unwrap();
+    let error = service
+        .decrypt(&encrypted_path, &output_path, &private_key_path, || {
+            Ok(passphrase
+                .expect("unencrypted keys must not prompt")
+                .to_vec())
+        })
+        .unwrap_err();
+    assert!(matches!(error, AppError::AuthenticationFailed));
+    assert_eq!(fs::read(&output_path).unwrap(), plaintext);
 }
