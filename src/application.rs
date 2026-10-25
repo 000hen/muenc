@@ -11,7 +11,8 @@ use crate::{
         method_for_header, method_for_public_key,
     },
     file_format,
-    io::{Progress, TransactionalOutput, open_input},
+    io::{TransactionalOutput, open_input},
+    progress::Progress,
 };
 
 const STREAM_BUFFER_SIZE: usize = 1024 * 1024;
@@ -40,13 +41,36 @@ impl EncryptionService {
         let private_path = output_directory.join(PRIVATE_KEY_FILE);
         let public_path = output_directory.join(PUBLIC_KEY_FILE);
 
-        let mut private_output = TransactionalOutput::new_private(&private_path)?;
+        let mut private_output = TransactionalOutput::new(&private_path)?;
         let mut public_output = TransactionalOutput::new(&public_path)?;
         write_output(&mut private_output, &keypair.private_key_pem, &private_path)?;
         write_output(&mut public_output, &keypair.public_key_pem, &public_path)?;
+        // Stage the previous public key before publishing either replacement.
+        let previous_public = match fs::read(&public_path) {
+            Ok(bytes) => {
+                let mut backup = TransactionalOutput::new(&public_path)?;
+                write_output(&mut backup, &bytes, &public_path)?;
+                Some(backup)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(AppError::io("back up the public key", &public_path, error)),
+        };
         public_output.commit()?;
-        private_output.commit()?;
-        restrict_private_key_permissions(&private_path)?;
+        if let Err(error) = private_output.commit() {
+            let rollback = match previous_public {
+                Some(backup) => backup.commit(),
+                None => fs::remove_file(&public_path).map_err(|error| {
+                    AppError::io("remove the new public key", &public_path, error)
+                }),
+            };
+            if let Err(rollback) = rollback {
+                return Err(AppError::KeypairRollback {
+                    publication: Box::new(error),
+                    rollback: Box::new(rollback),
+                });
+            }
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -191,18 +215,6 @@ fn write_output(writer: &mut dyn Write, bytes: &[u8], path: &Path) -> Result<()>
     writer
         .write_all(bytes)
         .map_err(|error| AppError::io("write the output file", path, error))
-}
-
-#[cfg(unix)]
-fn restrict_private_key_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| AppError::io("restrict private-key permissions", path, error))
-}
-
-#[cfg(not(unix))]
-fn restrict_private_key_permissions(_path: &Path) -> Result<()> {
-    Ok(())
 }
 
 pub fn default_encrypted_path(input: &Path) -> PathBuf {

@@ -1,12 +1,13 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, BufReader, BufWriter, IsTerminal, Read, Write},
+    io::{self, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, Instant},
 };
 
 use crate::{AppError, Result};
+
+pub use crate::progress::Progress;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -51,16 +52,8 @@ pub struct TransactionalOutput {
 }
 
 impl TransactionalOutput {
-    pub fn new(destination: &Path) -> Result<Self> {
-        Self::new_with_sensitivity(destination, false)
-    }
-
     /// Creates an output whose temporary file is private from the moment it is opened.
-    pub fn new_private(destination: &Path) -> Result<Self> {
-        Self::new_with_sensitivity(destination, true)
-    }
-
-    fn new_with_sensitivity(destination: &Path, private: bool) -> Result<Self> {
+    pub fn new(destination: &Path) -> Result<Self> {
         let parent = if is_stdio(destination) {
             std::env::temp_dir()
         } else {
@@ -86,12 +79,10 @@ impl TransactionalOutput {
             let mut options = OpenOptions::new();
             options.create_new(true).write(true);
             #[cfg(unix)]
-            if private {
+            {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
-            #[cfg(not(unix))]
-            let _ = private;
 
             match options.open(&temporary_path) {
                 Ok(file) => {
@@ -121,6 +112,11 @@ impl TransactionalOutput {
                 "too many temporary-file collisions",
             ),
         ))
+    }
+
+    /// Alias for `new`, which creates all temporary outputs with private permissions.
+    pub fn new_private(destination: &Path) -> Result<Self> {
+        Self::new(destination)
     }
 
     pub fn commit(mut self) -> Result<()> {
@@ -178,116 +174,9 @@ impl Drop for TransactionalOutput {
     }
 }
 
-#[cfg(not(windows))]
 fn replace_file(source: &Path, destination: &Path) -> Result<()> {
     fs::rename(source, destination)
         .map_err(|error| AppError::io("publish the output file", destination, error))
-}
-
-#[cfg(windows)]
-fn replace_file(source: &Path, destination: &Path) -> Result<()> {
-    if destination.exists() {
-        fs::remove_file(destination).map_err(|error| {
-            AppError::io("replace the previous output file", destination, error)
-        })?;
-    }
-    fs::rename(source, destination)
-        .map_err(|error| AppError::io("publish the output file", destination, error))
-}
-
-pub struct Progress {
-    label: &'static str,
-    total: Option<u64>,
-    processed: u64,
-    last_draw: Instant,
-    terminal: bool,
-    active: bool,
-}
-
-impl Progress {
-    pub fn new(label: &'static str, total: Option<u64>) -> Self {
-        let progress = Self {
-            label,
-            total,
-            processed: 0,
-            last_draw: Instant::now(),
-            terminal: io::stderr().is_terminal(),
-            active: true,
-        };
-        progress.draw();
-        progress
-    }
-
-    pub fn advance(&mut self, amount: usize) {
-        self.processed += amount as u64;
-        if self.last_draw.elapsed() >= Duration::from_millis(200) {
-            self.draw();
-            self.last_draw = Instant::now();
-        }
-    }
-
-    pub fn finish(mut self) {
-        self.draw();
-        let stderr = io::stderr();
-        let mut stderr = stderr.lock();
-        let _ = writeln!(stderr);
-        if self.terminal {
-            let _ = write_osc_progress(&mut stderr, 0, 0);
-        }
-        let _ = stderr.flush();
-        self.active = false;
-    }
-
-    fn draw(&self) {
-        let stderr = io::stderr();
-        let mut stderr = stderr.lock();
-        if self.terminal {
-            let (state, percentage) = terminal_progress(self.total, self.processed);
-            let _ = write_osc_progress(&mut stderr, state, percentage);
-        }
-        match self.total {
-            Some(0) | None => {
-                let _ = write!(stderr, "\r{}: {} bytes", self.label, self.processed);
-            }
-            Some(total) => {
-                let _ = write!(
-                    stderr,
-                    "\r{}: {}/{} bytes ({:.1}%)",
-                    self.label,
-                    self.processed,
-                    total,
-                    self.processed as f64 * 100.0 / total as f64
-                );
-            }
-        }
-        let _ = stderr.flush();
-    }
-}
-
-impl Drop for Progress {
-    fn drop(&mut self) {
-        if self.active && self.terminal {
-            let stderr = io::stderr();
-            let mut stderr = stderr.lock();
-            let _ = write_osc_progress(&mut stderr, 0, 0);
-            let _ = stderr.flush();
-        }
-    }
-}
-
-fn terminal_progress(total: Option<u64>, processed: u64) -> (u8, u8) {
-    match total {
-        Some(0) => (1, 0),
-        Some(total) => {
-            let percentage = ((processed.min(total) as u128 * 100) / total as u128) as u8;
-            (1, percentage)
-        }
-        None => (4, 0),
-    }
-}
-
-fn write_osc_progress(writer: &mut dyn Write, state: u8, percentage: u8) -> io::Result<()> {
-    write!(writer, "\x1b]9;4;{state};{percentage}\x07")
 }
 
 #[cfg(test)]
@@ -336,24 +225,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_progress_uses_percentages_for_sized_inputs() {
-        assert_eq!(terminal_progress(Some(400), 100), (1, 25));
-        assert_eq!(terminal_progress(Some(400), 500), (1, 100));
-    }
-
-    #[test]
-    fn terminal_progress_uses_state_four_for_stdio() {
-        assert_eq!(terminal_progress(None, 1024), (4, 0));
-    }
-
-    #[test]
-    fn osc_progress_uses_the_bell_terminated_sequence() {
-        let mut output = Vec::new();
-        write_osc_progress(&mut output, 1, 25).unwrap();
-        assert_eq!(output, b"\x1b]9;4;1;25\x07");
-    }
-
-    #[test]
     fn output_is_invisible_until_commit() {
         let directory = TestDirectory::new();
         let destination = directory.path("result.bin");
@@ -379,14 +250,63 @@ mod tests {
         assert_eq!(fs::read(destination).unwrap(), b"known-good result");
     }
 
+    #[test]
+    fn commit_replaces_an_existing_destination() {
+        let directory = TestDirectory::new();
+        let destination = directory.path("result.bin");
+        fs::write(&destination, b"previous result").unwrap();
+        let mut output = TransactionalOutput::new(&destination).unwrap();
+        output.write_all(b"complete replacement").unwrap();
+
+        output.commit().unwrap();
+
+        assert_eq!(fs::read(destination).unwrap(), b"complete replacement");
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_rename_preserves_the_existing_destination() {
+        let directory = TestDirectory::new();
+        let destination = directory.path("result.bin");
+        fs::write(&destination, b"known-good result").unwrap();
+
+        assert!(replace_file(&directory.path("missing-source"), &destination).is_err());
+
+        assert_eq!(fs::read(destination).unwrap(), b"known-good result");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_commit_preserves_a_locked_destination_and_removes_temporary_output() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let directory = TestDirectory::new();
+        let destination = directory.path("result.bin");
+        fs::write(&destination, b"known-good result").unwrap();
+        let locked = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&destination)
+            .unwrap();
+        let mut output = TransactionalOutput::new(&destination).unwrap();
+        let temporary_path = output.temporary_path.clone();
+        output.write_all(b"complete replacement").unwrap();
+
+        assert!(output.commit().is_err());
+        drop(locked);
+
+        assert_eq!(fs::read(destination).unwrap(), b"known-good result");
+        assert!(!temporary_path.exists());
+    }
+
     #[cfg(unix)]
     #[test]
-    fn private_output_is_never_accessible_to_other_users() {
+    fn ordinary_output_is_never_accessible_to_other_users() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = TestDirectory::new();
-        let destination = directory.path("private_key.pem");
-        let mut output = TransactionalOutput::new_private(&destination).unwrap();
+        let destination = directory.path("plaintext.bin");
+        let mut output = TransactionalOutput::new(&destination).unwrap();
         let temporary_mode = fs::metadata(&output.temporary_path)
             .unwrap()
             .permissions()
@@ -394,9 +314,26 @@ mod tests {
             & 0o777;
         assert_eq!(temporary_mode, 0o600);
 
-        output.write_all(b"private key").unwrap();
+        output.write_all(b"authenticated plaintext").unwrap();
         output.commit().unwrap();
         let published_mode = fs::metadata(destination).unwrap().permissions().mode() & 0o777;
         assert_eq!(published_mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdout_temporary_output_is_private_and_removed_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut output = TransactionalOutput::new(Path::new("-")).unwrap();
+        let temporary_path = output.temporary_path.clone();
+        output.write_all(b"unauthenticated plaintext").unwrap();
+        output.flush().unwrap();
+        let mode = fs::metadata(&temporary_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        drop(output);
+
+        assert!(!temporary_path.exists());
     }
 }

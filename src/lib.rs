@@ -4,5 +4,6 @@ pub mod crypto;
 pub mod error;
 pub mod file_format;
 pub mod io;
+pub mod progress;
 
 pub use error::{AppError, Result};

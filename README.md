@@ -46,6 +46,10 @@ muenc decrypt --input plain.txt.enc --key keys/private_key.pem
 Keys default to `~/.muenc` when `generate --output` is omitted; encryption and
 decryption use those keys when `--key` is omitted. Existing keys require
 `--force` to replace. Private keys are created with mode `0600` on Unix.
+All temporary outputs also use private permissions on Unix. If publishing the
+private key fails, generation attempts to restore the previous public key and
+reports any restoration failure. Updating two key files is not atomic across
+process termination or system failure; back up existing keys before replacing them.
 
 RSA/AES is the key-generation default. To select X25519/ChaCha20:
 

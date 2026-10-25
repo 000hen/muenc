@@ -23,6 +23,66 @@ use openssl::{
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+fn failed_private_key_publication_restores_the_previous_public_key() {
+    let directory = TestDirectory::new();
+    let public = directory.path("public_key.pem");
+    fs::write(&public, b"previous public key").unwrap();
+    fs::create_dir(directory.path("private_key.pem")).unwrap();
+
+    let error = EncryptionService::new()
+        .generate_keypair(&directory.0, None, Algorithm::X25519ChaCha20Poly1305)
+        .unwrap_err();
+    assert!(matches!(error, AppError::Io { .. }));
+    assert_eq!(fs::read(public).unwrap(), b"previous public key");
+    assert!(directory.path("private_key.pem").is_dir());
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+}
+
+#[test]
+fn failed_initial_key_publication_removes_the_new_public_key() {
+    let directory = TestDirectory::new();
+    fs::create_dir(directory.path("private_key.pem")).unwrap();
+    assert!(
+        EncryptionService::new()
+            .generate_keypair(&directory.0, None, Algorithm::X25519ChaCha20Poly1305)
+            .is_err()
+    );
+    assert!(!directory.path("public_key.pem").exists());
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn locked_private_key_preserves_the_existing_keypair() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let directory = TestDirectory::new();
+    let service = EncryptionService::new();
+    service
+        .generate_keypair(&directory.0, None, Algorithm::X25519ChaCha20Poly1305)
+        .unwrap();
+    let public = fs::read(directory.path("public_key.pem")).unwrap();
+    let private = fs::read(directory.path("private_key.pem")).unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(directory.path("private_key.pem"))
+        .unwrap();
+    assert!(
+        service
+            .generate_keypair(&directory.0, None, Algorithm::X25519ChaCha20Poly1305)
+            .is_err()
+    );
+    assert_eq!(fs::read(directory.path("public_key.pem")).unwrap(), public);
+    assert_eq!(
+        fs::read(directory.path("private_key.pem")).unwrap(),
+        private
+    );
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+    drop(lock);
+}
+
+#[test]
 fn every_registered_method_encrypts_through_the_same_interface() {
     for algorithm in [
         Algorithm::RsaAes256Gcm,

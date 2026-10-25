@@ -7,6 +7,13 @@ pub type Result<T> = std::result::Result<T, AppError>;
 
 #[derive(Debug, Error)]
 pub enum AppError {
+    #[error(
+        "key-pair publication failed: {publication}; restoring the public key also failed: {rollback}"
+    )]
+    KeypairRollback {
+        publication: Box<AppError>,
+        rollback: Box<AppError>,
+    },
     #[error("could not {action} '{}': {source}", path.display())]
     Io {
         action: &'static str,

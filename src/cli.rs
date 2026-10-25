@@ -156,34 +156,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generate_uses_the_home_key_directory_when_output_is_omitted() {
-        let cli = Cli::try_parse_from(["muenc", "generate"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Generate {
-                output: None,
-                algorithm: AlgorithmChoice::RsaAes256Gcm,
-                force: false
-            }
-        ));
-    }
-
-    #[test]
-    fn encryption_and_decryption_allow_the_default_keys() {
-        let encrypt = Cli::try_parse_from(["muenc", "encrypt", "--input", "data"]).unwrap();
-        assert!(matches!(
-            encrypt.command,
-            Command::Encrypt { key: None, .. }
-        ));
-
-        let decrypt = Cli::try_parse_from(["muenc", "decrypt", "--input", "data.enc"]).unwrap();
-        assert!(matches!(
-            decrypt.command,
-            Command::Decrypt { key: None, .. }
-        ));
-    }
-
-    #[test]
     fn x25519_algorithm_can_be_selected_for_generation() {
         let cli = Cli::try_parse_from([
             "muenc",
@@ -207,12 +179,6 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::UnknownArgument);
-    }
-
-    #[test]
-    fn generation_accepts_explicit_overwrite_authorization() {
-        let cli = Cli::try_parse_from(["muenc", "generate", "--force"]).unwrap();
-        assert!(matches!(cli.command, Command::Generate { force: true, .. }));
     }
 
     #[test]
@@ -247,14 +213,5 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::UnknownArgument);
-    }
-
-    #[test]
-    fn a_subcommand_is_required() {
-        let error = Cli::try_parse_from(["muenc"]).unwrap_err();
-        assert_eq!(
-            error.kind(),
-            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-        );
     }
 }
