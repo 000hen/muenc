@@ -1,127 +1,73 @@
 # muenc
 
-A command-line tool for streaming authenticated file encryption with versioned, self-describing algorithm metadata.
+A command-line tool for streaming authenticated file encryption with bounded
+memory and versioned algorithm metadata.
 
-## Highlights
+- Supports RSA-OAEP-SHA256 + AES-256-GCM and X25519-HKDF-SHA256 +
+  ChaCha20-Poly1305.
+- Selects encryption from the public-key type and decryption from the file
+  header.
+- Reads the original unversioned RSA/AES format.
+- Authenticates before publishing plaintext, including stdout, and uses
+  temporary files to preserve existing outputs on failure.
 
-- Streams large files with bounded memory and 1 MiB buffers.
-- Authenticates ciphertext before publishing any plaintext output.
-- Writes through temporary files, so failures do not destroy an existing output and input may safely equal output.
-- Detects whether a private key is encrypted and only then asks for its passphrase.
-- Never accepts passphrases as command-line arguments, where they can leak through shell history or process listings.
-- Supports RSA-OAEP-SHA256 + AES-256-GCM and X25519-HKDF-SHA256 + ChaCha20-Poly1305.
-- Automatically selects encryption from the public-key type and decryption from the file header.
-- Reads the original unversioned RSA/AES format produced by earlier releases.
-- Keeps algorithms isolated under `src/crypto/algorithms` for future PQC support.
+## Setup
 
-## Build
+Install Rust with support for edition 2024 and the native C build tools required
+by vendored OpenSSL. On Windows, put a native Windows Perl (such as Strawberry
+Perl) before MSYS Perl in `PATH`.
+
+## Installation
+
+From the repository root:
 
 ```powershell
-cargo build --release
+cargo install --path . --locked
 ```
 
-This produces the `muenc` binary (`target\release\muenc.exe` on Windows).
+Ensure Cargo's binary directory is in `PATH`. To build without installing:
 
-The project currently uses vendored OpenSSL. On Windows, ensure a native Windows Perl (for example Strawberry Perl) appears before MSYS Perl in `PATH` when compiling OpenSSL.
+```powershell
+cargo build --release --locked
+```
+
+The binary is `target/release/muenc` (`target\release\muenc.exe` on Windows).
 
 ## Usage
 
-Generate a key pair:
+Generate a key pair, then encrypt and decrypt a file:
 
 ```powershell
 muenc generate --output keys
+muenc encrypt --input plain.txt --key keys/public_key.pem
+muenc decrypt --input plain.txt.enc --key keys/private_key.pem
 ```
 
-If `--output` is omitted, keys are stored in `~/.muenc`. On Unix, the private
-key is created with mode `0600`. Existing keys are preserved unless replacement
-is explicitly authorized with `--force`; replacing a private key can make data
-encrypted with the old key unrecoverable.
+Keys default to `~/.muenc` when `generate --output` is omitted; encryption and
+decryption use those keys when `--key` is omitted. Existing keys require
+`--force` to replace. Private keys are created with mode `0600` on Unix.
 
-RSA/AES remains the generation default for CLI compatibility. Select the modern X25519/ChaCha20 suite with:
+RSA/AES is the key-generation default. To select X25519/ChaCha20:
 
 ```powershell
 muenc generate --output keys --algorithm x25519-chacha20-poly1305
 ```
 
-The program securely prompts for a private-key passphrase. Press Enter at the first prompt to create an unencrypted private key; otherwise, enter it again for confirmation.
+Key generation prompts for a private-key passphrase; leave it blank for an
+unencrypted key. Decryption prompts only for encrypted keys. Passphrases are
+never accepted as command-line arguments. Keep the private key and its
+passphrase safe: losing either makes encrypted files unrecoverable.
 
-Encrypt a file:
+Encryption appends `.enc` to the input path by default. Decryption removes
+`.enc`, or appends `.dec` when that suffix is absent. Use `--output` to choose a
+destination, `--input -` for stdin, or `--output -` for stdout.
 
-```powershell
-muenc encrypt --input plain.txt --key keys\public_key.pem
-```
-
-If `--key` is omitted, encryption uses `~/.muenc/public_key.pem`.
-
-The default output is `plain.txt.enc`. Use `--output -` for stdout or `--input -` for stdin.
-
-Decrypt a file:
-
-```powershell
-muenc decrypt --input plain.txt.enc --key keys\private_key.pem
-```
-
-If `--key` is omitted, decryption uses `~/.muenc/private_key.pem`.
-
-The program inspects the private key. An unencrypted key needs no input; an encrypted key triggers a hidden passphrase prompt. The default output removes `.enc`, or appends `.dec` if that suffix is absent.
-
-Run `muenc --help` or add `--help` after a subcommand for all options.
-
-The public key determines the encryption suite; no algorithm argument is required for encryption. The versioned encrypted-file header determines the suite during decryption.
-
-## Versioned file format
-
-Every preamble is 13 bytes. The legacy format is version zero, so its bytes remain exactly unchanged:
-
-```text
-00 00 00 00 "MUENC" 00 00 [version: u16 big-endian]
-```
-
-Version 1 then stores:
-
-```text
-[key-establishment: u16]
-[data-cipher: u16]
-[key-material-length: u32]
-[nonce-length: u16]
-[tag-length: u16]
-[key-establishment material]
-[nonce]
-[ciphertext]
-[authentication tag]
-```
-
-All integers are big-endian. The complete version-1 header—including algorithm identifiers, lengths, key material, and nonce—is authenticated as AEAD associated data.
-
-| IDs | Encryption suite |
-| --- | --- |
-| key `1`, cipher `1` | RSA-OAEP-SHA256 + AES-256-GCM |
-| key `2`, cipher `2` | X25519-HKDF-SHA256 + ChaCha20-Poly1305 |
-
-Both version-1 suites currently use a 12-byte nonce and a 16-byte authentication tag.
-
-Version 0 is still parsed as `[legacy magic][RSA-OAEP-SHA1 wrapped key][16-byte nonce][ciphertext][16-byte tag]`, allowing existing files to decrypt without conversion.
-
-## Architecture
-
-- `cli`: command parsing and secure passphrase prompts.
-- `application`: key generation and streaming encrypt/decrypt use cases.
-- `crypto`: suite interfaces, registry, shared OpenSSL streaming, and isolated algorithm implementations.
-- `file_format`: compatibility-critical format parsing and writing.
-- `io`: buffered input, progress, and transactional output.
-
-Additional algorithms implement `EncryptionSuite` and register an ID pair. The versioned header already provides the dispatch point needed for later PQC key-establishment algorithms.
-
-## Security behavior
-
-- A wrong key, damaged header or ciphertext, or modified authentication tag returns a normal error and leaves the destination untouched.
-- Decryption to stdout is also staged until authentication succeeds.
-- Private keys receive mode `0600` on Unix.
-- Losing a private key or its passphrase makes its encrypted files unrecoverable.
+Run `muenc --help` or `muenc <subcommand> --help` for all options.
 
 ## Development
 
-Unit tests live beside each module and cover version parsing, algorithm dispatch, CLI safety, key detection, path rules, and transactional I/O. End-to-end tests cover both suites, authenticated headers, passphrases, and legacy compatibility.
+Unit tests live beside their modules; integration tests are in
+`tests/compatibility.rs`.
 
 ```powershell
 cargo fmt --check
@@ -131,4 +77,4 @@ cargo test
 
 ## License
 
-See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
