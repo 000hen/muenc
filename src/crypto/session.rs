@@ -1,11 +1,14 @@
-use openssl::{rand, symm::Cipher};
+use openssl::rand;
 
 use crate::{
     AppError, Result,
-    file_format::{self, VersionedHeader},
+    file_format::{self, FileHeader},
 };
 
-use super::{AlgorithmDetails, Encapsulation, StreamDecryptor, StreamEncryptor, TAG_SIZE};
+use super::{
+    AlgorithmDetails, DataCipher, KeyEstablishment, NONCE_SIZE, StreamDecryptor, StreamEncryptor,
+    TAG_SIZE,
+};
 
 pub struct EncryptionSession {
     pub header: Vec<u8>,
@@ -16,12 +19,16 @@ pub struct EncryptionSession {
 
 impl EncryptionSession {
     pub(crate) fn versioned(
-        details: AlgorithmDetails,
-        cipher: Cipher,
-        nonce_size: usize,
-        encapsulation: Encapsulation,
+        key_establishment: &dyn KeyEstablishment,
+        cipher: &dyn DataCipher,
+        public_key_pem: &[u8],
     ) -> Result<Self> {
-        let mut nonce = vec![0; nonce_size];
+        let encapsulation = key_establishment.encapsulate(public_key_pem)?;
+        let details = AlgorithmDetails {
+            key_establishment: key_establishment.id(),
+            data_cipher: cipher.id(),
+        };
+        let mut nonce = [0_u8; NONCE_SIZE];
         rand::rand_bytes(&mut nonce)
             .map_err(|error| AppError::crypto("generating the encryption nonce", error))?;
         let header = file_format::encode_versioned_header(
@@ -30,6 +37,7 @@ impl EncryptionSession {
             &nonce,
             TAG_SIZE,
         );
+        let cipher = cipher.openssl_cipher();
         let mut encryptor = StreamEncryptor::new(cipher, &encapsulation.data_key, &nonce)?;
         encryptor.authenticate_header(&header)?;
         Ok(Self {
@@ -50,11 +58,17 @@ pub struct DecryptionSession {
 
 impl DecryptionSession {
     pub(crate) fn versioned(
-        cipher: Cipher,
-        header: VersionedHeader,
-        data_key: &[u8],
+        key_establishment: &dyn KeyEstablishment,
+        cipher: &dyn DataCipher,
+        header: FileHeader,
+        private_key_pem: &[u8],
+        passphrase: Option<&[u8]>,
     ) -> Result<Self> {
-        let mut decryptor = StreamDecryptor::new(cipher, data_key, &header.nonce)?;
+        let header = header.versioned(NONCE_SIZE, TAG_SIZE)?;
+        let data_key =
+            key_establishment.decapsulate(private_key_pem, passphrase, &header.key_material)?;
+        let cipher = cipher.openssl_cipher();
+        let mut decryptor = StreamDecryptor::new(cipher, &data_key, &header.nonce)?;
         decryptor.authenticate_header(&header.authenticated_bytes)?;
         Ok(Self {
             decryptor,

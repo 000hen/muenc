@@ -3,10 +3,10 @@
 A command-line tool for streaming authenticated file encryption with bounded
 memory and versioned algorithm metadata.
 
-- Supports RSA-OAEP-SHA256 + AES-256-GCM and X25519-HKDF-SHA256 +
-  ChaCha20-Poly1305.
-- Selects encryption from the public-key type and decryption from the file
-  header.
+- Key types: RSA-OAEP-SHA256, X25519-HKDF-SHA256, and hybrid post-quantum
+  X25519 + ML-KEM-768 with HKDF-SHA256. Data ciphers: AES-256-GCM and
+  ChaCha20-Poly1305. Any key type works with either cipher.
+- Selects the key type from the public key and decryption from the file header.
 - Reads the original unversioned RSA/AES format.
 - Authenticates before publishing plaintext, including stdout, and uses
   temporary files to preserve existing outputs on failure.
@@ -51,11 +51,23 @@ private key fails, generation attempts to restore the previous public key and
 reports any restoration failure. Updating two key files is not atomic across
 process termination or system failure; back up existing keys before replacing them.
 
-RSA/AES is the key-generation default. To select X25519/ChaCha20:
+`generate --algorithm` selects the key type: `rsa` (default), `x25519`, or
+`x25519-mlkem768`. The data cipher is chosen when encrypting with
+`--cipher aes-256-gcm` or `--cipher chacha20-poly1305`; without it, RSA keys use
+AES-256-GCM and the other key types use ChaCha20-Poly1305. Decryption reads the
+key type and cipher from the file header.
 
 ```powershell
-muenc generate --output keys --algorithm x25519-chacha20-poly1305
+muenc generate --output keys --algorithm x25519-mlkem768
+muenc encrypt --input plain.txt --key keys/public_key.pem --cipher aes-256-gcm
 ```
+
+The former names `rsa-aes-256-gcm`, `x25519-chacha20-poly1305`, and
+`x25519-mlkem768-chacha20-poly1305` are still accepted as `--algorithm` values
+and select only the key type.
+
+Hybrid key files contain two PEM blocks, ML-KEM-768 first and X25519 second;
+keep both blocks together.
 
 Key generation prompts for a private-key passphrase; leave it blank for an
 unencrypted key. Decryption prompts only for encrypted keys. Passphrases are

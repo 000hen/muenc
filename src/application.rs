@@ -7,7 +7,7 @@ use std::{
 use crate::{
     AppError, Result,
     crypto::{
-        Algorithm, is_encrypted_pem, method_for_algorithm, method_for_header, prepare_encryption,
+        CipherAlgorithm, KeyAlgorithm, is_encrypted_pem, method_for_header, prepare_encryption,
     },
     file_format,
     io::{TransactionalOutput, open_input},
@@ -22,12 +22,12 @@ const PUBLIC_KEY_FILE: &str = "public_key.pem";
 pub fn generate_keypair(
     output_directory: &Path,
     passphrase: Option<&[u8]>,
-    algorithm: Algorithm,
+    algorithm: KeyAlgorithm,
 ) -> Result<()> {
     fs::create_dir_all(output_directory).map_err(|error| {
         AppError::io("create the key output directory", output_directory, error)
     })?;
-    let keypair = method_for_algorithm(algorithm).generate_keypair(passphrase)?;
+    let keypair = algorithm.key_establishment().generate_keypair(passphrase)?;
     let private_path = output_directory.join(PRIVATE_KEY_FILE);
     let public_path = output_directory.join(PUBLIC_KEY_FILE);
 
@@ -63,9 +63,15 @@ pub fn generate_keypair(
     Ok(())
 }
 
-pub fn encrypt(input_path: &Path, output_path: &Path, public_key_path: &Path) -> Result<()> {
+/// Encrypts with `cipher`, or the public key type's default cipher when it is `None`.
+pub fn encrypt(
+    input_path: &Path,
+    output_path: &Path,
+    public_key_path: &Path,
+    cipher: Option<CipherAlgorithm>,
+) -> Result<()> {
     let public_key_pem = read_file(public_key_path, "read the public key")?;
-    let session = prepare_encryption(&public_key_pem)?;
+    let session = prepare_encryption(&public_key_pem, cipher)?;
     let mut encryptor = session.encryptor;
 
     let mut input = open_input(input_path)?;

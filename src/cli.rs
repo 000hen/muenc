@@ -8,7 +8,7 @@ use crate::{
         self, default_decrypted_path, default_encrypted_path, default_key_directory,
         default_private_key_path, default_public_key_path, keypair_exists,
     },
-    crypto::Algorithm,
+    crypto::{CipherAlgorithm, KeyAlgorithm},
 };
 
 #[derive(Parser, Debug)]
@@ -31,9 +31,9 @@ enum Command {
         /// Directory for public_key.pem and private_key.pem. Defaults to ~/.muenc.
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Encryption algorithm for the generated key pair.
-        #[arg(short, long, value_enum, default_value_t = Algorithm::RsaAes256Gcm)]
-        algorithm: Algorithm,
+        /// Key type for the generated key pair; the data cipher is chosen at encryption.
+        #[arg(short, long, value_enum, default_value_t = KeyAlgorithm::Rsa)]
+        algorithm: KeyAlgorithm,
         /// Replace an existing public/private key pair.
         #[arg(long)]
         force: bool,
@@ -49,6 +49,9 @@ enum Command {
         /// PEM public key used to encrypt the file. Defaults to ~/.muenc/public_key.pem.
         #[arg(short, long)]
         key: Option<PathBuf>,
+        /// Data cipher. Defaults to aes-256-gcm for RSA keys and chacha20-poly1305 otherwise.
+        #[arg(short, long, value_enum)]
+        cipher: Option<CipherAlgorithm>,
     },
     /// Decrypt and authenticate a file using a private key.
     Decrypt {
@@ -82,13 +85,22 @@ pub fn run() -> Result<()> {
             }
             let passphrase = prompt_new_passphrase()?;
             application::generate_keypair(&output, passphrase.as_deref(), algorithm)?;
-            eprintln!("{algorithm} key pair saved to {}", output.display());
+            eprintln!(
+                "{} key pair saved to {}",
+                algorithm.key_establishment().name(),
+                output.display()
+            );
             eprintln!("Keep private_key.pem safe; lost private keys cannot be recovered.");
         }
-        Command::Encrypt { input, output, key } => {
+        Command::Encrypt {
+            input,
+            output,
+            key,
+            cipher,
+        } => {
             let key = key.map_or_else(default_public_key_path, Ok)?;
             let output = output.unwrap_or_else(|| default_encrypted_path(&input));
-            application::encrypt(&input, &output, &key)?;
+            application::encrypt(&input, &output, &key, cipher)?;
             eprintln!("Encrypted file saved to {}", output.display());
         }
         Command::Decrypt { input, output, key } => {
@@ -136,22 +148,71 @@ mod tests {
 
     use super::*;
 
+    fn generate_algorithm(args: &[&str]) -> KeyAlgorithm {
+        let cli = Cli::try_parse_from([&["muenc", "generate"], args].concat()).unwrap();
+        let Command::Generate { algorithm, .. } = cli.command else {
+            panic!("expected the generate command");
+        };
+        algorithm
+    }
+
     #[test]
-    fn x25519_algorithm_can_be_selected_for_generation() {
-        let cli = Cli::try_parse_from([
+    fn generate_selects_only_the_key_type() {
+        assert_eq!(generate_algorithm(&[]), KeyAlgorithm::Rsa);
+        for (value, expected) in [
+            ("rsa", KeyAlgorithm::Rsa),
+            ("x25519", KeyAlgorithm::X25519),
+            ("x25519-mlkem768", KeyAlgorithm::X25519MlKem768),
+        ] {
+            assert_eq!(generate_algorithm(&["--algorithm", value]), expected);
+        }
+    }
+
+    #[test]
+    fn generate_accepts_the_former_combined_algorithm_names() {
+        for (value, expected) in [
+            ("rsa-aes-256-gcm", KeyAlgorithm::Rsa),
+            ("x25519-chacha20-poly1305", KeyAlgorithm::X25519),
+            (
+                "x25519-mlkem768-chacha20-poly1305",
+                KeyAlgorithm::X25519MlKem768,
+            ),
+        ] {
+            assert_eq!(generate_algorithm(&["-a", value]), expected);
+        }
+    }
+
+    fn encrypt_cipher(args: &[&str]) -> Option<CipherAlgorithm> {
+        let cli =
+            Cli::try_parse_from([&["muenc", "encrypt", "--input", "data.bin"], args].concat())
+                .unwrap();
+        let Command::Encrypt { cipher, .. } = cli.command else {
+            panic!("expected the encrypt command");
+        };
+        cipher
+    }
+
+    #[test]
+    fn encrypt_cipher_is_optional_and_selectable() {
+        assert_eq!(encrypt_cipher(&[]), None);
+        assert_eq!(
+            encrypt_cipher(&["--cipher", "aes-256-gcm"]),
+            Some(CipherAlgorithm::Aes256Gcm)
+        );
+        assert_eq!(
+            encrypt_cipher(&["-c", "chacha20-poly1305"]),
+            Some(CipherAlgorithm::ChaCha20Poly1305)
+        );
+        let error = Cli::try_parse_from([
             "muenc",
-            "generate",
-            "--algorithm",
-            "x25519-chacha20-poly1305",
+            "encrypt",
+            "--input",
+            "data.bin",
+            "--cipher",
+            "aes-128-cbc",
         ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Generate {
-                algorithm: Algorithm::X25519ChaCha20Poly1305,
-                ..
-            }
-        ));
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
     }
 
     #[test]

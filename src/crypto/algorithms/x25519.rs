@@ -1,33 +1,42 @@
-use std::io::Read;
+//! Ephemeral-static X25519 key agreement with an HKDF-SHA256 data key.
 
 use openssl::{
     derive::Deriver,
     md::Md,
-    pkey::{Id, PKey, Public},
+    pkey::{HasPrivate, HasPublic, Id, PKey},
     pkey_ctx::PkeyCtx,
     symm::Cipher,
 };
 
-use crate::{AppError, Result, file_format::FileHeader};
+use crate::{AppError, Result};
 
-use super::super::{
-    AlgorithmDetails, DATA_KEY_SIZE, DecryptionMethod, DecryptionSession, Encapsulation,
-    EncryptionMethod, EncryptionSession, KeyPair, TAG_SIZE, key_utils::load_private_key,
+use super::{
+    super::{
+        DATA_KEY_SIZE, DataCipher, Encapsulation, KeyEstablishment, KeyPair,
+        key_utils::{load_private_key, load_public_key},
+    },
+    chacha20_poly1305::ChaCha20Poly1305,
 };
 
-pub const KEY_ESTABLISHMENT_ID: u16 = 2;
-pub const DATA_CIPHER_ID: u16 = 2;
-const NONCE_SIZE: usize = 12;
+const KEY_ESTABLISHMENT_ID: u16 = 2;
+const KEY_NAME: &str = "X25519";
 const HKDF_SALT: &[u8] = b"MUENC-X25519-HKDF-SHA256-v1";
 
-pub struct X25519ChaCha20Poly1305;
+pub struct X25519;
 
-const DETAILS: AlgorithmDetails = AlgorithmDetails {
-    key_establishment: KEY_ESTABLISHMENT_ID,
-    data_cipher: DATA_CIPHER_ID,
-};
+impl KeyEstablishment for X25519 {
+    fn id(&self) -> u16 {
+        KEY_ESTABLISHMENT_ID
+    }
 
-impl EncryptionMethod for X25519ChaCha20Poly1305 {
+    fn name(&self) -> &'static str {
+        KEY_NAME
+    }
+
+    fn default_cipher(&self) -> &'static dyn DataCipher {
+        &ChaCha20Poly1305
+    }
+
     fn generate_keypair(&self, passphrase: Option<&[u8]>) -> Result<KeyPair> {
         let key = PKey::generate_x25519()
             .map_err(|error| AppError::crypto("generating the X25519 key pair", error))?;
@@ -48,18 +57,8 @@ impl EncryptionMethod for X25519ChaCha20Poly1305 {
         })
     }
 
-    fn prepare_encryption(&self, public_key: &PKey<Public>) -> Result<EncryptionSession> {
-        EncryptionSession::versioned(
-            DETAILS,
-            Cipher::chacha20_poly1305(),
-            NONCE_SIZE,
-            self.encapsulate(public_key)?,
-        )
-    }
-}
-
-impl X25519ChaCha20Poly1305 {
-    fn encapsulate(&self, recipient: &PKey<Public>) -> Result<Encapsulation> {
+    fn encapsulate(&self, public_key_pem: &[u8]) -> Result<Encapsulation> {
+        let recipient = load_public_key(public_key_pem, Id::X25519)?;
         let ephemeral = PKey::generate_x25519()
             .map_err(|error| AppError::crypto("generating an ephemeral X25519 key", error))?;
         let key_material = ephemeral
@@ -68,8 +67,8 @@ impl X25519ChaCha20Poly1305 {
         let recipient_public = recipient
             .raw_public_key()
             .map_err(|error| AppError::crypto("reading the recipient X25519 key", error))?;
-        let shared = derive_shared_secret(&ephemeral, recipient)?;
-        let data_key = derive_data_key(&shared, &key_material, &recipient_public)?;
+        let shared = derive_shared_secret(&ephemeral, &recipient)?;
+        let data_key = derive_data_key(HKDF_SALT, &shared, &[&key_material, &recipient_public])?;
         Ok(Encapsulation {
             data_key,
             key_material,
@@ -82,35 +81,21 @@ impl X25519ChaCha20Poly1305 {
         passphrase: Option<&[u8]>,
         key_material: &[u8],
     ) -> Result<Vec<u8>> {
-        let recipient = load_private_key(private_key_pem, passphrase, Id::X25519, "X25519")?;
+        let recipient = load_private_key(private_key_pem, passphrase, Id::X25519, KEY_NAME)?;
         let ephemeral = PKey::public_key_from_raw_bytes(key_material, Id::X25519)
             .map_err(|_| AppError::InvalidFormat("invalid ephemeral X25519 public key".into()))?;
         let recipient_public = recipient
             .raw_public_key()
             .map_err(|error| AppError::crypto("reading the recipient X25519 key", error))?;
         let shared = derive_shared_secret(&recipient, &ephemeral)?;
-        derive_data_key(&shared, key_material, &recipient_public)
+        derive_data_key(HKDF_SALT, &shared, &[key_material, &recipient_public])
     }
 }
 
-impl DecryptionMethod for X25519ChaCha20Poly1305 {
-    fn prepare_decryption(
-        &self,
-        _reader: &mut dyn Read,
-        header: FileHeader,
-        private_key_pem: &[u8],
-        passphrase: Option<&[u8]>,
-    ) -> Result<DecryptionSession> {
-        let header = header.versioned(NONCE_SIZE, TAG_SIZE)?;
-        let data_key = self.decapsulate(private_key_pem, passphrase, &header.key_material)?;
-        DecryptionSession::versioned(Cipher::chacha20_poly1305(), header, &data_key)
-    }
-}
-
-fn derive_shared_secret<T, U>(private_key: &PKey<T>, peer: &PKey<U>) -> Result<Vec<u8>>
+pub(super) fn derive_shared_secret<T, U>(private_key: &PKey<T>, peer: &PKey<U>) -> Result<Vec<u8>>
 where
-    T: openssl::pkey::HasPrivate,
-    U: openssl::pkey::HasPublic,
+    T: HasPrivate,
+    U: HasPublic,
 {
     let mut deriver = Deriver::new(private_key)
         .map_err(|error| AppError::crypto("initializing X25519 key agreement", error))?;
@@ -126,10 +111,13 @@ where
     Ok(shared)
 }
 
-fn derive_data_key(
+/// Derives the data key with HKDF-SHA256; `info` parts are concatenated in order. The data
+/// cipher is not an HKDF input: it is authenticated as header AAD, and every file derives a
+/// fresh key from a new ephemeral secret.
+pub(super) fn derive_data_key(
+    salt: &[u8],
     shared_secret: &[u8],
-    ephemeral_public: &[u8],
-    recipient_public: &[u8],
+    info: &[&[u8]],
 ) -> Result<Vec<u8>> {
     let mut context = PkeyCtx::new_id(Id::HKDF)
         .map_err(|error| AppError::crypto("initializing HKDF-SHA256", error))?;
@@ -137,13 +125,12 @@ fn derive_data_key(
         .derive_init()
         .and_then(|_| context.set_hkdf_md(Md::sha256()))
         .and_then(|_| context.set_hkdf_key(shared_secret))
-        .and_then(|_| context.set_hkdf_salt(HKDF_SALT))
-        .and_then(|_| context.add_hkdf_info(ephemeral_public))
-        .and_then(|_| context.add_hkdf_info(recipient_public))
+        .and_then(|_| context.set_hkdf_salt(salt))
+        .and_then(|_| info.iter().try_for_each(|part| context.add_hkdf_info(part)))
         .map_err(|error| AppError::crypto("configuring HKDF-SHA256", error))?;
     let mut data_key = vec![0_u8; DATA_KEY_SIZE];
     context
         .derive(Some(&mut data_key))
-        .map_err(|error| AppError::crypto("deriving the ChaCha20 data key", error))?;
+        .map_err(|error| AppError::crypto("deriving the data key", error))?;
     Ok(data_key)
 }

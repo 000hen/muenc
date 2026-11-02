@@ -6,7 +6,9 @@ repository = "https://github.com/000hen/muenc"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
+foreign-types = "0.3.2"
 openssl = { version = "0.10.82", features = ["vendored"] }
+openssl-sys = "0.9.118"
 rpassword = "7.5.4"
 thiserror = "2.0.21"
 
