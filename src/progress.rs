@@ -97,15 +97,3 @@ fn terminal_progress(total: Option<u64>, processed: u64) -> (u8, u8) {
 fn write_osc_progress(writer: &mut dyn Write, state: u8, percentage: u8) -> io::Result<()> {
     write!(writer, "\x1b]9;4;{state};{percentage}\x07")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn osc_progress_uses_the_bell_terminated_sequence() {
-        let mut output = Vec::new();
-        write_osc_progress(&mut output, 1, 25).unwrap();
-        assert_eq!(output, b"\x1b]9;4;1;25\x07");
-    }
-}

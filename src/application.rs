@@ -7,8 +7,7 @@ use std::{
 use crate::{
     AppError, Result,
     crypto::{
-        Algorithm, KeyProtection, detect_key_protection, key_generator_for_algorithm,
-        method_for_header, method_for_public_key,
+        Algorithm, is_encrypted_pem, method_for_algorithm, method_for_header, prepare_encryption,
     },
     file_format,
     io::{TransactionalOutput, open_input},
@@ -20,191 +19,157 @@ const DEFAULT_KEY_DIRECTORY: &str = ".muenc";
 const PRIVATE_KEY_FILE: &str = "private_key.pem";
 const PUBLIC_KEY_FILE: &str = "public_key.pem";
 
-#[derive(Default)]
-pub struct EncryptionService;
+pub fn generate_keypair(
+    output_directory: &Path,
+    passphrase: Option<&[u8]>,
+    algorithm: Algorithm,
+) -> Result<()> {
+    fs::create_dir_all(output_directory).map_err(|error| {
+        AppError::io("create the key output directory", output_directory, error)
+    })?;
+    let keypair = method_for_algorithm(algorithm).generate_keypair(passphrase)?;
+    let private_path = output_directory.join(PRIVATE_KEY_FILE);
+    let public_path = output_directory.join(PUBLIC_KEY_FILE);
 
-impl EncryptionService {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub fn generate_keypair(
-        &self,
-        output_directory: &Path,
-        passphrase: Option<&[u8]>,
-        algorithm: Algorithm,
-    ) -> Result<()> {
-        fs::create_dir_all(output_directory).map_err(|error| {
-            AppError::io("create the key output directory", output_directory, error)
-        })?;
-        let keypair = key_generator_for_algorithm(algorithm).generate_keypair(passphrase)?;
-        let private_path = output_directory.join(PRIVATE_KEY_FILE);
-        let public_path = output_directory.join(PUBLIC_KEY_FILE);
-
-        let mut private_output = TransactionalOutput::new(&private_path)?;
-        let mut public_output = TransactionalOutput::new(&public_path)?;
-        write_output(&mut private_output, &keypair.private_key_pem, &private_path)?;
-        write_output(&mut public_output, &keypair.public_key_pem, &public_path)?;
-        // Stage the previous public key before publishing either replacement.
-        let previous_public = match fs::read(&public_path) {
-            Ok(bytes) => {
-                let mut backup = TransactionalOutput::new(&public_path)?;
-                write_output(&mut backup, &bytes, &public_path)?;
-                Some(backup)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(AppError::io("back up the public key", &public_path, error)),
+    let mut private_output = TransactionalOutput::new(&private_path)?;
+    let mut public_output = TransactionalOutput::new(&public_path)?;
+    write_output(&mut private_output, &keypair.private_key_pem, &private_path)?;
+    write_output(&mut public_output, &keypair.public_key_pem, &public_path)?;
+    // Stage the previous public key before publishing either replacement.
+    let previous_public = match fs::read(&public_path) {
+        Ok(bytes) => {
+            let mut backup = TransactionalOutput::new(&public_path)?;
+            write_output(&mut backup, &bytes, &public_path)?;
+            Some(backup)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(AppError::io("back up the public key", &public_path, error)),
+    };
+    public_output.commit()?;
+    if let Err(error) = private_output.commit() {
+        let rollback = match previous_public {
+            Some(backup) => backup.commit(),
+            None => fs::remove_file(&public_path)
+                .map_err(|error| AppError::io("remove the new public key", &public_path, error)),
         };
-        public_output.commit()?;
-        if let Err(error) = private_output.commit() {
-            let rollback = match previous_public {
-                Some(backup) => backup.commit(),
-                None => fs::remove_file(&public_path).map_err(|error| {
-                    AppError::io("remove the new public key", &public_path, error)
-                }),
-            };
-            if let Err(rollback) = rollback {
-                return Err(AppError::KeypairRollback {
-                    publication: Box::new(error),
-                    rollback: Box::new(rollback),
-                });
-            }
-            return Err(error);
+        if let Err(rollback) = rollback {
+            return Err(AppError::KeypairRollback {
+                publication: Box::new(error),
+                rollback: Box::new(rollback),
+            });
         }
-        Ok(())
+        return Err(error);
     }
-
-    pub fn encrypt(
-        &self,
-        input_path: &Path,
-        output_path: &Path,
-        public_key_path: &Path,
-    ) -> Result<()> {
-        let public_key_pem = read_file(public_key_path, "read the public key")?;
-        let method = method_for_public_key(&public_key_pem)?;
-        let session = method.prepare_encryption(&public_key_pem)?;
-        let mut encryptor = session.encryptor;
-
-        let mut input = open_input(input_path)?;
-        let mut output = TransactionalOutput::new(output_path)?;
-        write_output(&mut output, &session.header, output_path)?;
-        let mut input_buffer = vec![0_u8; STREAM_BUFFER_SIZE];
-        let mut output_buffer = vec![0_u8; STREAM_BUFFER_SIZE + session.block_size];
-        let mut progress = Progress::new("Encrypting", input.size);
-
-        loop {
-            let count = input
-                .reader
-                .read(&mut input_buffer)
-                .map_err(|error| AppError::io("read the input file", input_path, error))?;
-            if count == 0 {
-                break;
-            }
-            let encrypted = encryptor.update(&input_buffer[..count], &mut output_buffer)?;
-            write_output(&mut output, &output_buffer[..encrypted], output_path)?;
-            progress.advance(count);
-        }
-
-        let final_count = encryptor.finalize(&mut output_buffer)?;
-        write_output(&mut output, &output_buffer[..final_count], output_path)?;
-        let mut tag = vec![0_u8; session.tag_size];
-        encryptor.authentication_tag(&mut tag)?;
-        write_output(&mut output, &tag, output_path)?;
-        output.commit()?;
-        progress.finish();
-        Ok(())
-    }
-
-    pub fn decrypt<F>(
-        &self,
-        input_path: &Path,
-        output_path: &Path,
-        private_key_path: &Path,
-        mut request_passphrase: F,
-    ) -> Result<()>
-    where
-        F: FnMut() -> Result<Vec<u8>>,
-    {
-        let private_key_pem = read_file(private_key_path, "read the private key")?;
-        let mut input = open_input(input_path)?;
-        let header = file_format::read_header(&mut input.reader)?;
-        let method = method_for_header(&header)?;
-        let passphrase = passphrase_for(&private_key_pem, &mut request_passphrase)?;
-        let session = method.prepare_decryption(
-            &mut input.reader,
-            header,
-            &private_key_pem,
-            passphrase.as_deref(),
-        )?;
-        let tag_size = session.tag_size;
-        let header_size = session.header_size;
-        let mut decryptor = session.decryptor;
-
-        let ciphertext_size = input
-            .size
-            .map(|file_size| {
-                file_size
-                    .checked_sub((header_size + tag_size) as u64)
-                    .ok_or_else(|| {
-                        AppError::InvalidFormat(
-                            "file is too small to contain its header and authentication tag".into(),
-                        )
-                    })
-            })
-            .transpose()?;
-        let mut output = TransactionalOutput::new(output_path)?;
-        let mut input_buffer = vec![0_u8; STREAM_BUFFER_SIZE];
-        let mut pending = Vec::with_capacity(STREAM_BUFFER_SIZE + tag_size);
-        let mut output_buffer = vec![0_u8; STREAM_BUFFER_SIZE + session.block_size];
-        let mut progress = Progress::new("Decrypting", ciphertext_size);
-
-        loop {
-            let count = input
-                .reader
-                .read(&mut input_buffer)
-                .map_err(|error| AppError::io("read the encrypted file", input_path, error))?;
-            if count == 0 {
-                break;
-            }
-            pending.extend_from_slice(&input_buffer[..count]);
-            let ciphertext_count = pending.len().saturating_sub(tag_size);
-            if ciphertext_count == 0 {
-                continue;
-            }
-
-            let decrypted = decryptor.update(
-                &pending[..ciphertext_count],
-                &mut output_buffer[..ciphertext_count + session.block_size],
-            )?;
-            write_output(&mut output, &output_buffer[..decrypted], output_path)?;
-            progress.advance(ciphertext_count);
-            pending.copy_within(ciphertext_count.., 0);
-            pending.truncate(tag_size);
-        }
-
-        if pending.len() != tag_size {
-            return Err(AppError::InvalidFormat(
-                "missing or incomplete authentication tag".into(),
-            ));
-        }
-        decryptor.set_authentication_tag(&pending)?;
-        let final_count = decryptor.finalize(&mut output_buffer)?;
-        write_output(&mut output, &output_buffer[..final_count], output_path)?;
-        output.commit()?;
-        progress.finish();
-        Ok(())
-    }
+    Ok(())
 }
 
-fn passphrase_for<F>(private_key_pem: &[u8], request_passphrase: &mut F) -> Result<Option<Vec<u8>>>
-where
-    F: FnMut() -> Result<Vec<u8>>,
-{
-    match detect_key_protection(private_key_pem) {
-        KeyProtection::Unencrypted => Ok(None),
-        KeyProtection::Encrypted => Ok(Some(request_passphrase()?)),
-        KeyProtection::Unknown => Err(AppError::InvalidPrivateKey),
+pub fn encrypt(input_path: &Path, output_path: &Path, public_key_path: &Path) -> Result<()> {
+    let public_key_pem = read_file(public_key_path, "read the public key")?;
+    let session = prepare_encryption(&public_key_pem)?;
+    let mut encryptor = session.encryptor;
+
+    let mut input = open_input(input_path)?;
+    let mut output = TransactionalOutput::new(output_path)?;
+    write_output(&mut output, &session.header, output_path)?;
+    let mut input_buffer = vec![0_u8; STREAM_BUFFER_SIZE];
+    let mut output_buffer = vec![0_u8; STREAM_BUFFER_SIZE + session.block_size];
+    let mut progress = Progress::new("Encrypting", input.size);
+
+    loop {
+        let count = input
+            .reader
+            .read(&mut input_buffer)
+            .map_err(|error| AppError::io("read the input file", input_path, error))?;
+        if count == 0 {
+            break;
+        }
+        let encrypted = encryptor.update(&input_buffer[..count], &mut output_buffer)?;
+        write_output(&mut output, &output_buffer[..encrypted], output_path)?;
+        progress.advance(count);
     }
+
+    let final_count = encryptor.finalize(&mut output_buffer)?;
+    write_output(&mut output, &output_buffer[..final_count], output_path)?;
+    let mut tag = vec![0_u8; session.tag_size];
+    encryptor.authentication_tag(&mut tag)?;
+    write_output(&mut output, &tag, output_path)?;
+    output.commit()?;
+    progress.finish();
+    Ok(())
+}
+
+pub fn decrypt<F>(
+    input_path: &Path,
+    output_path: &Path,
+    private_key_path: &Path,
+    request_passphrase: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<Vec<u8>>,
+{
+    let private_key_pem = read_file(private_key_path, "read the private key")?;
+    let mut input = open_input(input_path)?;
+    let header = file_format::read_header(&mut input.reader)?;
+    let method = method_for_header(&header)?;
+    // Malformed keys are rejected once, by the method that loads them.
+    let passphrase = is_encrypted_pem(&private_key_pem)
+        .then(request_passphrase)
+        .transpose()?;
+    let session = method.prepare_decryption(
+        &mut input.reader,
+        header,
+        &private_key_pem,
+        passphrase.as_deref(),
+    )?;
+    let tag_size = session.tag_size;
+    let header_size = session.header_size;
+    let mut decryptor = session.decryptor;
+
+    // Truncated files are rejected after the loop by the authentication-tag check.
+    let ciphertext_size = input
+        .size
+        .map(|file_size| file_size.saturating_sub((header_size + tag_size) as u64));
+    let mut output = TransactionalOutput::new(output_path)?;
+    let mut input_buffer = vec![0_u8; STREAM_BUFFER_SIZE];
+    let mut pending = Vec::with_capacity(STREAM_BUFFER_SIZE + tag_size);
+    let mut output_buffer = vec![0_u8; STREAM_BUFFER_SIZE + session.block_size];
+    let mut progress = Progress::new("Decrypting", ciphertext_size);
+
+    loop {
+        let count = input
+            .reader
+            .read(&mut input_buffer)
+            .map_err(|error| AppError::io("read the encrypted file", input_path, error))?;
+        if count == 0 {
+            break;
+        }
+        pending.extend_from_slice(&input_buffer[..count]);
+        let ciphertext_count = pending.len().saturating_sub(tag_size);
+        if ciphertext_count == 0 {
+            continue;
+        }
+
+        let decrypted = decryptor.update(
+            &pending[..ciphertext_count],
+            &mut output_buffer[..ciphertext_count + session.block_size],
+        )?;
+        write_output(&mut output, &output_buffer[..decrypted], output_path)?;
+        progress.advance(ciphertext_count);
+        pending.copy_within(ciphertext_count.., 0);
+        pending.truncate(tag_size);
+    }
+
+    if pending.len() != tag_size {
+        return Err(AppError::InvalidFormat(
+            "missing or incomplete authentication tag".into(),
+        ));
+    }
+    decryptor.set_authentication_tag(&pending)?;
+    let final_count = decryptor.finalize(&mut output_buffer)?;
+    write_output(&mut output, &output_buffer[..final_count], output_path)?;
+    output.commit()?;
+    progress.finish();
+    Ok(())
 }
 
 fn read_file(path: &Path, action: &'static str) -> Result<Vec<u8>> {
@@ -222,8 +187,8 @@ pub fn default_encrypted_path(input: &Path) -> PathBuf {
 }
 
 pub fn default_key_directory() -> Result<PathBuf> {
-    home_directory()
-        .map(|home| key_directory_in(&home))
+    env::home_dir()
+        .map(|home| home.join(DEFAULT_KEY_DIRECTORY))
         .ok_or(AppError::HomeDirectoryUnavailable)
 }
 
@@ -239,42 +204,12 @@ pub fn keypair_exists(directory: &Path) -> bool {
     public_key_path(directory).exists() || private_key_path(directory).exists()
 }
 
-fn key_directory_in(home: &Path) -> PathBuf {
-    home.join(DEFAULT_KEY_DIRECTORY)
-}
-
 fn public_key_path(directory: &Path) -> PathBuf {
     directory.join(PUBLIC_KEY_FILE)
 }
 
 fn private_key_path(directory: &Path) -> PathBuf {
     directory.join(PRIVATE_KEY_FILE)
-}
-
-#[cfg(windows)]
-fn home_directory() -> Option<PathBuf> {
-    env::var_os("USERPROFILE")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            let drive = env::var_os("HOMEDRIVE").filter(|value| !value.is_empty())?;
-            let path = env::var_os("HOMEPATH").filter(|value| !value.is_empty())?;
-            let mut home = PathBuf::from(drive);
-            home.push(path);
-            Some(home)
-        })
-        .or_else(|| {
-            env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-        })
-}
-
-#[cfg(not(windows))]
-fn home_directory() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
 }
 
 pub fn default_decrypted_path(input: &Path) -> PathBuf {
@@ -309,17 +244,6 @@ mod tests {
         assert_eq!(
             default_decrypted_path(Path::new("archive.bin")),
             PathBuf::from("archive.bin.dec")
-        );
-    }
-
-    #[test]
-    fn default_keys_are_stored_in_a_hidden_home_directory() {
-        let directory = key_directory_in(Path::new("home"));
-        assert_eq!(directory, Path::new("home").join(DEFAULT_KEY_DIRECTORY));
-        assert_eq!(public_key_path(&directory), directory.join(PUBLIC_KEY_FILE));
-        assert_eq!(
-            private_key_path(&directory),
-            directory.join(PRIVATE_KEY_FILE)
         );
     }
 

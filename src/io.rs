@@ -7,8 +7,6 @@ use std::{
 
 use crate::{AppError, Result};
 
-pub use crate::progress::Progress;
-
 const BUFFER_SIZE: usize = 1024 * 1024;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -54,22 +52,19 @@ pub struct TransactionalOutput {
 impl TransactionalOutput {
     /// Creates an output whose temporary file is private from the moment it is opened.
     pub fn new(destination: &Path) -> Result<Self> {
-        let parent = if is_stdio(destination) {
-            std::env::temp_dir()
+        let (parent, stem) = if is_stdio(destination) {
+            (std::env::temp_dir(), "muenc-stdout")
         } else {
-            destination
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
-        };
-        let stem = if is_stdio(destination) {
-            "muenc-stdout".to_string()
-        } else {
-            destination
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("muenc-output")
-                .to_string()
+            (
+                destination
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf(),
+                destination
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("muenc-output"),
+            )
         };
 
         for _ in 0..100 {
@@ -114,11 +109,6 @@ impl TransactionalOutput {
         ))
     }
 
-    /// Alias for `new`, which creates all temporary outputs with private permissions.
-    pub fn new_private(destination: &Path) -> Result<Self> {
-        Self::new(destination)
-    }
-
     pub fn commit(mut self) -> Result<()> {
         if let Some(mut writer) = self.writer.take() {
             writer.flush().map_err(|error| {
@@ -145,7 +135,9 @@ impl TransactionalOutput {
                 AppError::io("remove the temporary output", &self.temporary_path, error)
             })?;
         } else {
-            replace_file(&self.temporary_path, &self.destination)?;
+            fs::rename(&self.temporary_path, &self.destination).map_err(|error| {
+                AppError::io("publish the output file", &self.destination, error)
+            })?;
         }
         self.committed = true;
         Ok(())
@@ -172,11 +164,6 @@ impl Drop for TransactionalOutput {
             let _ = fs::remove_file(&self.temporary_path);
         }
     }
-}
-
-fn replace_file(source: &Path, destination: &Path) -> Result<()> {
-    fs::rename(source, destination)
-        .map_err(|error| AppError::io("publish the output file", destination, error))
 }
 
 #[cfg(test)]
@@ -262,17 +249,6 @@ mod tests {
 
         assert_eq!(fs::read(destination).unwrap(), b"complete replacement");
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn failed_rename_preserves_the_existing_destination() {
-        let directory = TestDirectory::new();
-        let destination = directory.path("result.bin");
-        fs::write(&destination, b"known-good result").unwrap();
-
-        assert!(replace_file(&directory.path("missing-source"), &destination).is_err());
-
-        assert_eq!(fs::read(destination).unwrap(), b"known-good result");
     }
 
     #[cfg(windows)]

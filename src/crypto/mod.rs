@@ -6,28 +6,22 @@ mod session;
 
 use std::io::Read;
 
+use openssl::pkey::{PKey, Public};
+
 use crate::{Result, file_format::FileHeader};
 
-pub use key_utils::detect_key_protection;
-pub use registry::{
-    Algorithm, key_generator_for_algorithm, method_for_algorithm, method_for_details,
-    method_for_header, method_for_public_key,
-};
+pub use key_utils::is_encrypted_pem;
+pub use openssl_stream::{StreamDecryptor, StreamEncryptor};
+pub use registry::{Algorithm, method_for_algorithm, method_for_header, prepare_encryption};
 pub use session::{DecryptionSession, EncryptionSession};
 
 pub const DATA_KEY_SIZE: usize = 32;
+pub(crate) const TAG_SIZE: usize = 16;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct AlgorithmDetails {
     pub key_establishment: u16,
     pub data_cipher: u16,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum KeyProtection {
-    Unencrypted,
-    Encrypted,
-    Unknown,
 }
 
 pub struct KeyPair {
@@ -40,23 +34,14 @@ pub struct Encapsulation {
     pub key_material: Vec<u8>,
 }
 
-pub trait StreamEncryptor {
-    fn authenticate_header(&mut self, header: &[u8]) -> Result<()>;
-    fn update(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize>;
-    fn finalize(&mut self, output: &mut [u8]) -> Result<usize>;
-    fn authentication_tag(&mut self, tag: &mut [u8]) -> Result<()>;
+/// A method the CLI can generate keys for and encrypt new files with.
+pub trait EncryptionMethod {
+    fn generate_keypair(&self, passphrase: Option<&[u8]>) -> Result<KeyPair>;
+    fn prepare_encryption(&self, public_key: &PKey<Public>) -> Result<EncryptionSession>;
 }
 
-pub trait StreamDecryptor {
-    fn authenticate_header(&mut self, header: &[u8]) -> Result<()>;
-    fn update(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize>;
-    fn set_authentication_tag(&mut self, tag: &[u8]) -> Result<()>;
-    fn finalize(&mut self, output: &mut [u8]) -> Result<usize>;
-}
-
-/// Prepares a complete encryption or decryption stream, including method-specific framing.
-pub trait EncryptionMethod: Send + Sync {
-    fn prepare_encryption(&self, public_key_pem: &[u8]) -> Result<EncryptionSession>;
+/// A method able to read an encrypted file, including method-specific framing after the header.
+pub trait DecryptionMethod {
     fn prepare_decryption(
         &self,
         reader: &mut dyn Read,
@@ -64,9 +49,4 @@ pub trait EncryptionMethod: Send + Sync {
         private_key_pem: &[u8],
         passphrase: Option<&[u8]>,
     ) -> Result<DecryptionSession>;
-}
-
-/// Key generation is independent of encrypted-file processing.
-pub trait KeyPairGenerator: Send + Sync {
-    fn generate_keypair(&self, passphrase: Option<&[u8]>) -> Result<KeyPair>;
 }

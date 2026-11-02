@@ -3,7 +3,7 @@ use std::io::Read;
 use openssl::{
     derive::Deriver,
     md::Md,
-    pkey::{Id, PKey},
+    pkey::{Id, PKey, Public},
     pkey_ctx::PkeyCtx,
     symm::Cipher,
 };
@@ -11,17 +11,15 @@ use openssl::{
 use crate::{AppError, Result, file_format::FileHeader};
 
 use super::super::{
-    AlgorithmDetails, DATA_KEY_SIZE, DecryptionSession, Encapsulation, EncryptionMethod,
-    EncryptionSession, KeyPair, KeyPairGenerator, key_utils::load_private_key,
+    AlgorithmDetails, DATA_KEY_SIZE, DecryptionMethod, DecryptionSession, Encapsulation,
+    EncryptionMethod, EncryptionSession, KeyPair, TAG_SIZE, key_utils::load_private_key,
 };
 
 pub const KEY_ESTABLISHMENT_ID: u16 = 2;
 pub const DATA_CIPHER_ID: u16 = 2;
 const NONCE_SIZE: usize = 12;
-const PUBLIC_KEY_SIZE: usize = 32;
 const HKDF_SALT: &[u8] = b"MUENC-X25519-HKDF-SHA256-v1";
 
-#[derive(Default)]
 pub struct X25519ChaCha20Poly1305;
 
 const DETAILS: AlgorithmDetails = AlgorithmDetails {
@@ -29,14 +27,14 @@ const DETAILS: AlgorithmDetails = AlgorithmDetails {
     data_cipher: DATA_CIPHER_ID,
 };
 
-impl KeyPairGenerator for X25519ChaCha20Poly1305 {
+impl EncryptionMethod for X25519ChaCha20Poly1305 {
     fn generate_keypair(&self, passphrase: Option<&[u8]>) -> Result<KeyPair> {
         let key = PKey::generate_x25519()
             .map_err(|error| AppError::crypto("generating the X25519 key pair", error))?;
         let public_key_pem = key
             .public_key_to_pem()
             .map_err(|error| AppError::crypto("encoding the X25519 public key", error))?;
-        let private_key_pem = match passphrase.filter(|value| !value.is_empty()) {
+        let private_key_pem = match passphrase {
             Some(passphrase) => key
                 .private_key_to_pem_pkcs8_passphrase(Cipher::aes_256_cbc(), passphrase)
                 .map_err(|error| AppError::crypto("encrypting the X25519 private key", error))?,
@@ -49,15 +47,19 @@ impl KeyPairGenerator for X25519ChaCha20Poly1305 {
             public_key_pem,
         })
     }
+
+    fn prepare_encryption(&self, public_key: &PKey<Public>) -> Result<EncryptionSession> {
+        EncryptionSession::versioned(
+            DETAILS,
+            Cipher::chacha20_poly1305(),
+            NONCE_SIZE,
+            self.encapsulate(public_key)?,
+        )
+    }
 }
 
 impl X25519ChaCha20Poly1305 {
-    fn encapsulate(&self, public_key_pem: &[u8]) -> Result<Encapsulation> {
-        let recipient =
-            PKey::public_key_from_pem(public_key_pem).map_err(|_| AppError::InvalidPublicKey)?;
-        if recipient.id() != Id::X25519 {
-            return Err(AppError::KeyAlgorithmMismatch { expected: "X25519" });
-        }
+    fn encapsulate(&self, recipient: &PKey<Public>) -> Result<Encapsulation> {
         let ephemeral = PKey::generate_x25519()
             .map_err(|error| AppError::crypto("generating an ephemeral X25519 key", error))?;
         let key_material = ephemeral
@@ -66,7 +68,7 @@ impl X25519ChaCha20Poly1305 {
         let recipient_public = recipient
             .raw_public_key()
             .map_err(|error| AppError::crypto("reading the recipient X25519 key", error))?;
-        let shared = derive_shared_secret(&ephemeral, &recipient)?;
+        let shared = derive_shared_secret(&ephemeral, recipient)?;
         let data_key = derive_data_key(&shared, &key_material, &recipient_public)?;
         Ok(Encapsulation {
             data_key,
@@ -80,11 +82,6 @@ impl X25519ChaCha20Poly1305 {
         passphrase: Option<&[u8]>,
         key_material: &[u8],
     ) -> Result<Vec<u8>> {
-        if key_material.len() != PUBLIC_KEY_SIZE {
-            return Err(AppError::InvalidFormat(
-                "X25519 key material must be 32 bytes".into(),
-            ));
-        }
         let recipient = load_private_key(private_key_pem, passphrase, Id::X25519, "X25519")?;
         let ephemeral = PKey::public_key_from_raw_bytes(key_material, Id::X25519)
             .map_err(|_| AppError::InvalidFormat("invalid ephemeral X25519 public key".into()))?;
@@ -96,16 +93,7 @@ impl X25519ChaCha20Poly1305 {
     }
 }
 
-impl EncryptionMethod for X25519ChaCha20Poly1305 {
-    fn prepare_encryption(&self, public_key_pem: &[u8]) -> Result<EncryptionSession> {
-        EncryptionSession::versioned(
-            DETAILS,
-            Cipher::chacha20_poly1305(),
-            NONCE_SIZE,
-            self.encapsulate(public_key_pem)?,
-        )
-    }
-
+impl DecryptionMethod for X25519ChaCha20Poly1305 {
     fn prepare_decryption(
         &self,
         _reader: &mut dyn Read,
@@ -113,7 +101,7 @@ impl EncryptionMethod for X25519ChaCha20Poly1305 {
         private_key_pem: &[u8],
         passphrase: Option<&[u8]>,
     ) -> Result<DecryptionSession> {
-        let header = header.versioned(DETAILS, NONCE_SIZE, 16)?;
+        let header = header.versioned(NONCE_SIZE, TAG_SIZE)?;
         let data_key = self.decapsulate(private_key_pem, passphrase, &header.key_material)?;
         DecryptionSession::versioned(Cipher::chacha20_poly1305(), header, &data_key)
     }

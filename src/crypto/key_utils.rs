@@ -2,19 +2,10 @@ use openssl::pkey::{Id, PKey, Private};
 
 use crate::{AppError, Result};
 
-use super::KeyProtection;
-
-pub fn detect_key_protection(pem: &[u8]) -> KeyProtection {
-    if pem
-        .windows(b"ENCRYPTED".len())
+/// Detects passphrase-protected PEM without calling OpenSSL, which could prompt on the terminal.
+pub fn is_encrypted_pem(pem: &[u8]) -> bool {
+    pem.windows(b"ENCRYPTED".len())
         .any(|part| part == b"ENCRYPTED")
-    {
-        return KeyProtection::Encrypted;
-    }
-    if PKey::private_key_from_pem(pem).is_ok() {
-        return KeyProtection::Unencrypted;
-    }
-    KeyProtection::Unknown
 }
 
 pub fn load_private_key(
@@ -44,21 +35,22 @@ mod tests {
     fn encrypted_marker_is_detected_without_open_ssl_prompting() {
         let pem =
             b"-----BEGIN ENCRYPTED PRIVATE KEY-----\ninvalid\n-----END ENCRYPTED PRIVATE KEY-----";
-        assert_eq!(detect_key_protection(pem), KeyProtection::Encrypted);
+        assert!(is_encrypted_pem(pem));
     }
 
     #[test]
-    fn malformed_key_has_unknown_protection() {
-        assert_eq!(
-            detect_key_protection(b"not a private key"),
-            KeyProtection::Unknown
-        );
+    fn malformed_key_is_rejected_as_an_invalid_private_key() {
+        let error = load_private_key(b"not a private key", None, Id::RSA, "RSA").unwrap_err();
+        assert!(matches!(error, AppError::InvalidPrivateKey));
     }
 
     #[test]
-    fn unencrypted_x25519_key_is_detected() {
-        let key = PKey::generate_x25519().unwrap();
-        let pem = key.private_key_to_pem_pkcs8().unwrap();
-        assert_eq!(detect_key_protection(&pem), KeyProtection::Unencrypted);
+    fn unencrypted_x25519_key_loads_without_a_passphrase() {
+        let pem = PKey::generate_x25519()
+            .unwrap()
+            .private_key_to_pem_pkcs8()
+            .unwrap();
+        assert!(!is_encrypted_pem(&pem));
+        assert!(load_private_key(&pem, None, Id::X25519, "X25519").is_ok());
     }
 }

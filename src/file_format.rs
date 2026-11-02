@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::Read;
 
 use crate::{AppError, Result, crypto::AlgorithmDetails};
 
@@ -7,10 +7,7 @@ pub const LEGACY_VERSION: u16 = 0;
 pub const CURRENT_VERSION: u16 = 1;
 pub const MAGIC_PREFIX: &[u8; 11] = b"\0\0\0\0MUENC\0\0";
 pub const LEGACY_MAGIC: &[u8; PREAMBLE_SIZE] = b"\0\0\0\0MUENC\0\0\0\0";
-// Retained as a source-compatible name for code that referenced the old constant.
-pub const MAGIC_NUMBER: &[u8; PREAMBLE_SIZE] = LEGACY_MAGIC;
 
-pub const LEGACY_DATA_KEY_SIZE: usize = 32;
 pub const LEGACY_NONCE_SIZE: usize = 16;
 pub const LEGACY_TAG_SIZE: usize = 16;
 
@@ -19,12 +16,6 @@ const MAX_KEY_MATERIAL_SIZE: usize = 16 * 1024 * 1024;
 const MAX_NONCE_SIZE: usize = 64;
 const MAX_TAG_SIZE: usize = 64;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum FormatVersion {
-    Legacy,
-    Version1,
-}
-
 /// Parsed framing before any method-specific private-key operation.
 pub enum FileHeader {
     Legacy,
@@ -32,36 +23,18 @@ pub enum FileHeader {
 }
 
 impl FileHeader {
-    pub(crate) fn versioned(
-        self,
-        details: AlgorithmDetails,
-        nonce_size: usize,
-        tag_size: usize,
-    ) -> Result<VersionedHeader> {
+    pub(crate) fn versioned(self, nonce_size: usize, tag_size: usize) -> Result<VersionedHeader> {
         let Self::Version1(header) = self else {
             return Err(AppError::InvalidFormat(
                 "method requires a version-1 header".into(),
             ));
         };
-        if header.details != details {
-            return Err(AppError::UnsupportedAlgorithms {
-                key_establishment: header.details.key_establishment,
-                data_cipher: header.details.data_cipher,
-            });
-        }
         if header.nonce.len() != nonce_size || header.tag_size != tag_size {
             return Err(AppError::InvalidFormat(format!(
                 "method requires a {nonce_size}-byte nonce and {tag_size}-byte authentication tag"
             )));
         }
         Ok(header)
-    }
-}
-
-pub fn read_header(reader: &mut dyn Read) -> Result<FileHeader> {
-    match read_version(reader)? {
-        FormatVersion::Legacy => Ok(FileHeader::Legacy),
-        FormatVersion::Version1 => Ok(FileHeader::Version1(read_versioned_header(reader)?)),
     }
 }
 
@@ -73,12 +46,6 @@ pub struct VersionedHeader {
     pub authenticated_bytes: Vec<u8>,
 }
 
-impl VersionedHeader {
-    pub fn encoded_size(&self) -> usize {
-        self.authenticated_bytes.len()
-    }
-}
-
 pub fn preamble(version: u16) -> [u8; PREAMBLE_SIZE] {
     let mut bytes = [0_u8; PREAMBLE_SIZE];
     bytes[..MAGIC_PREFIX.len()].copy_from_slice(MAGIC_PREFIX);
@@ -86,7 +53,7 @@ pub fn preamble(version: u16) -> [u8; PREAMBLE_SIZE] {
     bytes
 }
 
-pub fn read_version(reader: &mut dyn Read) -> Result<FormatVersion> {
+pub fn read_header(reader: &mut dyn Read) -> Result<FileHeader> {
     let mut bytes = [0_u8; PREAMBLE_SIZE];
     read_format_exact(reader, &mut bytes, "missing or incomplete format preamble")?;
     if &bytes[..MAGIC_PREFIX.len()] != MAGIC_PREFIX {
@@ -96,47 +63,36 @@ pub fn read_version(reader: &mut dyn Read) -> Result<FormatVersion> {
     }
     let version = u16::from_be_bytes([bytes[MAGIC_PREFIX.len()], bytes[MAGIC_PREFIX.len() + 1]]);
     match version {
-        LEGACY_VERSION => Ok(FormatVersion::Legacy),
-        CURRENT_VERSION => Ok(FormatVersion::Version1),
+        LEGACY_VERSION => Ok(FileHeader::Legacy),
+        CURRENT_VERSION => Ok(FileHeader::Version1(read_versioned_header(reader)?)),
         version => Err(AppError::InvalidFormat(format!(
             "unsupported format version {version}"
         ))),
     }
 }
 
-pub fn write_versioned_header(
-    writer: &mut dyn Write,
+/// Encodes a header for our own methods, whose sizes are fixed or bounded by the RSA modulus.
+pub fn encode_versioned_header(
     details: AlgorithmDetails,
     key_material: &[u8],
     nonce: &[u8],
     tag_size: usize,
-) -> Result<Vec<u8>> {
-    validate_lengths(key_material.len(), nonce.len(), tag_size)?;
-    let key_material_len = u32::try_from(key_material.len())
-        .map_err(|_| AppError::InvalidFormat("key material is too large".into()))?;
-    let nonce_len = u16::try_from(nonce.len())
-        .map_err(|_| AppError::InvalidFormat("nonce is too large".into()))?;
-    let tag_len = u16::try_from(tag_size)
-        .map_err(|_| AppError::InvalidFormat("authentication tag is too large".into()))?;
-
+) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(
         PREAMBLE_SIZE + VERSIONED_METADATA_SIZE + key_material.len() + nonce.len(),
     );
     encoded.extend_from_slice(&preamble(CURRENT_VERSION));
     encoded.extend_from_slice(&details.key_establishment.to_be_bytes());
     encoded.extend_from_slice(&details.data_cipher.to_be_bytes());
-    encoded.extend_from_slice(&key_material_len.to_be_bytes());
-    encoded.extend_from_slice(&nonce_len.to_be_bytes());
-    encoded.extend_from_slice(&tag_len.to_be_bytes());
+    encoded.extend_from_slice(&(key_material.len() as u32).to_be_bytes());
+    encoded.extend_from_slice(&(nonce.len() as u16).to_be_bytes());
+    encoded.extend_from_slice(&(tag_size as u16).to_be_bytes());
     encoded.extend_from_slice(key_material);
     encoded.extend_from_slice(nonce);
-    writer
-        .write_all(&encoded)
-        .map_err(|error| AppError::io("write the encrypted-file header", "<output>", error))?;
-    Ok(encoded)
+    encoded
 }
 
-pub fn read_versioned_header(reader: &mut dyn Read) -> Result<VersionedHeader> {
+fn read_versioned_header(reader: &mut dyn Read) -> Result<VersionedHeader> {
     let mut metadata = [0_u8; VERSIONED_METADATA_SIZE];
     read_format_exact(
         reader,
@@ -224,46 +180,37 @@ mod tests {
     #[test]
     fn legacy_preamble_is_version_zero() {
         assert_eq!(preamble(LEGACY_VERSION), *LEGACY_MAGIC);
-        assert_eq!(
-            read_version(&mut Cursor::new(LEGACY_MAGIC)).unwrap(),
-            FormatVersion::Legacy
-        );
-    }
-
-    #[test]
-    fn requested_version_uses_the_final_two_bytes() {
-        let encoded = preamble(0x1234);
-        assert_eq!(&encoded[..MAGIC_PREFIX.len()], MAGIC_PREFIX);
-        assert_eq!(&encoded[MAGIC_PREFIX.len()..], &[0x12, 0x34]);
+        assert!(matches!(
+            read_header(&mut Cursor::new(LEGACY_MAGIC)),
+            Ok(FileHeader::Legacy)
+        ));
     }
 
     #[test]
     fn versioned_header_round_trips_algorithm_details_and_lengths() {
-        let mut encoded = Vec::new();
-        let authenticated =
-            write_versioned_header(&mut encoded, DETAILS, &[7; 32], &[9; 12], 16).unwrap();
-        let mut reader = Cursor::new(encoded);
+        let encoded = encode_versioned_header(DETAILS, &[7; 32], &[9; 12], 16);
 
-        assert_eq!(read_version(&mut reader).unwrap(), FormatVersion::Version1);
-        let decoded = read_versioned_header(&mut reader).unwrap();
+        let Ok(FileHeader::Version1(decoded)) = read_header(&mut Cursor::new(&encoded)) else {
+            panic!("expected a version-1 header");
+        };
         assert_eq!(decoded.details, DETAILS);
         assert_eq!(decoded.key_material, [7; 32]);
         assert_eq!(decoded.nonce, [9; 12]);
         assert_eq!(decoded.tag_size, 16);
-        assert_eq!(decoded.authenticated_bytes, authenticated);
+        assert_eq!(decoded.authenticated_bytes, encoded);
     }
 
     #[test]
     fn wrong_magic_returns_a_format_error() {
         let mut bytes = preamble(CURRENT_VERSION);
         bytes[4] ^= 0xff;
-        let error = read_version(&mut Cursor::new(bytes)).unwrap_err();
+        let error = read_header(&mut Cursor::new(bytes)).err().unwrap();
         assert!(matches!(error, AppError::InvalidFormat(message) if message.contains("magic")));
     }
 
     #[test]
     fn unsupported_version_returns_a_format_error() {
-        let error = read_version(&mut Cursor::new(preamble(99))).unwrap_err();
+        let error = read_header(&mut Cursor::new(preamble(99))).err().unwrap();
         assert!(
             matches!(error, AppError::InvalidFormat(message) if message.contains("version 99"))
         );

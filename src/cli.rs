@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 
 use crate::{
     AppError, Result,
     application::{
-        EncryptionService, default_decrypted_path, default_encrypted_path, default_key_directory,
+        self, default_decrypted_path, default_encrypted_path, default_key_directory,
         default_private_key_path, default_public_key_path, keypair_exists,
     },
     crypto::Algorithm,
@@ -32,8 +32,8 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Encryption algorithm for the generated key pair.
-        #[arg(short, long, value_enum, default_value_t = AlgorithmChoice::RsaAes256Gcm)]
-        algorithm: AlgorithmChoice,
+        #[arg(short, long, value_enum, default_value_t = Algorithm::RsaAes256Gcm)]
+        algorithm: Algorithm,
         /// Replace an existing public/private key pair.
         #[arg(long)]
         force: bool,
@@ -64,26 +64,8 @@ enum Command {
     },
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum AlgorithmChoice {
-    #[value(name = "rsa-aes-256-gcm")]
-    RsaAes256Gcm,
-    #[value(name = "x25519-chacha20-poly1305")]
-    X25519ChaCha20Poly1305,
-}
-
-impl From<AlgorithmChoice> for Algorithm {
-    fn from(value: AlgorithmChoice) -> Self {
-        match value {
-            AlgorithmChoice::RsaAes256Gcm => Self::RsaAes256Gcm,
-            AlgorithmChoice::X25519ChaCha20Poly1305 => Self::X25519ChaCha20Poly1305,
-        }
-    }
-}
-
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let service = EncryptionService::new();
 
     match cli.command {
         Command::Generate {
@@ -99,21 +81,20 @@ pub fn run() -> Result<()> {
                 );
             }
             let passphrase = prompt_new_passphrase()?;
-            let algorithm = Algorithm::from(algorithm);
-            service.generate_keypair(&output, passphrase.as_deref(), algorithm)?;
+            application::generate_keypair(&output, passphrase.as_deref(), algorithm)?;
             eprintln!("{algorithm} key pair saved to {}", output.display());
             eprintln!("Keep private_key.pem safe; lost private keys cannot be recovered.");
         }
         Command::Encrypt { input, output, key } => {
             let key = key.map_or_else(default_public_key_path, Ok)?;
             let output = output.unwrap_or_else(|| default_encrypted_path(&input));
-            service.encrypt(&input, &output, &key)?;
+            application::encrypt(&input, &output, &key)?;
             eprintln!("Encrypted file saved to {}", output.display());
         }
         Command::Decrypt { input, output, key } => {
             let key = key.map_or_else(default_private_key_path, Ok)?;
             let output = output.unwrap_or_else(|| default_decrypted_path(&input));
-            service.decrypt(&input, &output, &key, prompt_existing_passphrase)?;
+            application::decrypt(&input, &output, &key, prompt_existing_passphrase)?;
             eprintln!("Decrypted file saved to {}", output.display());
         }
     }
@@ -167,7 +148,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Generate {
-                algorithm: AlgorithmChoice::X25519ChaCha20Poly1305,
+                algorithm: Algorithm::X25519ChaCha20Poly1305,
                 ..
             }
         ));

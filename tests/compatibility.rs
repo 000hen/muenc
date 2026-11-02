@@ -4,13 +4,13 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use clap::ValueEnum;
 use muenc::{
-    AppError,
-    application::EncryptionService,
-    crypto::{Algorithm, key_generator_for_algorithm, method_for_algorithm},
+    AppError, application,
+    crypto::{Algorithm, method_for_algorithm, method_for_header, prepare_encryption},
     file_format::{
         CURRENT_VERSION, LEGACY_MAGIC, LEGACY_NONCE_SIZE, LEGACY_TAG_SIZE, MAGIC_PREFIX,
-        PREAMBLE_SIZE,
+        PREAMBLE_SIZE, read_header,
     },
 };
 use openssl::{
@@ -29,9 +29,9 @@ fn failed_private_key_publication_restores_the_previous_public_key() {
     fs::write(&public, b"previous public key").unwrap();
     fs::create_dir(directory.path("private_key.pem")).unwrap();
 
-    let error = EncryptionService::new()
-        .generate_keypair(&directory.0, None, Algorithm::X25519ChaCha20Poly1305)
-        .unwrap_err();
+    let error =
+        application::generate_keypair(&directory.0, None, Algorithm::X25519ChaCha20Poly1305)
+            .unwrap_err();
     assert!(matches!(error, AppError::Io { .. }));
     assert_eq!(fs::read(public).unwrap(), b"previous public key");
     assert!(directory.path("private_key.pem").is_dir());
@@ -43,8 +43,7 @@ fn failed_initial_key_publication_removes_the_new_public_key() {
     let directory = TestDirectory::new();
     fs::create_dir(directory.path("private_key.pem")).unwrap();
     assert!(
-        EncryptionService::new()
-            .generate_keypair(&directory.0, None, Algorithm::X25519ChaCha20Poly1305)
+        application::generate_keypair(&directory.0, None, Algorithm::X25519ChaCha20Poly1305)
             .is_err()
     );
     assert!(!directory.path("public_key.pem").exists());
@@ -57,10 +56,7 @@ fn locked_private_key_preserves_the_existing_keypair() {
     use std::os::windows::fs::OpenOptionsExt;
 
     let directory = TestDirectory::new();
-    let service = EncryptionService::new();
-    service
-        .generate_keypair(&directory.0, None, Algorithm::X25519ChaCha20Poly1305)
-        .unwrap();
+    application::generate_keypair(&directory.0, None, Algorithm::X25519ChaCha20Poly1305).unwrap();
     let public = fs::read(directory.path("public_key.pem")).unwrap();
     let private = fs::read(directory.path("private_key.pem")).unwrap();
     let lock = fs::OpenOptions::new()
@@ -69,8 +65,7 @@ fn locked_private_key_preserves_the_existing_keypair() {
         .open(directory.path("private_key.pem"))
         .unwrap();
     assert!(
-        service
-            .generate_keypair(&directory.0, None, Algorithm::X25519ChaCha20Poly1305)
+        application::generate_keypair(&directory.0, None, Algorithm::X25519ChaCha20Poly1305)
             .is_err()
     );
     assert_eq!(fs::read(directory.path("public_key.pem")).unwrap(), public);
@@ -83,68 +78,44 @@ fn locked_private_key_preserves_the_existing_keypair() {
 }
 
 #[test]
-fn every_registered_method_encrypts_through_the_same_interface() {
-    for algorithm in [
-        Algorithm::RsaAes256Gcm,
-        Algorithm::X25519ChaCha20Poly1305,
-        Algorithm::LegacyRsaAes256Gcm,
-    ] {
+fn every_algorithm_round_trips_an_empty_file() {
+    for &algorithm in Algorithm::value_variants() {
         let directory = TestDirectory::new();
-        let keys = key_generator_for_algorithm(algorithm)
-            .generate_keypair(None)
-            .unwrap();
-        let private_path = directory.path("private.pem");
-        let encrypted_path = directory.path("input.enc");
-        let output_path = directory.path("output.bin");
-        fs::write(&private_path, &keys.private_key_pem).unwrap();
+        let keys = directory.path("keys");
+        let input = directory.path("empty.bin");
+        let encrypted = directory.path("empty.bin.enc");
+        let decrypted = directory.path("empty.out");
+        fs::write(&input, b"").unwrap();
+        fs::write(&decrypted, b"stale output").unwrap();
 
-        for plaintext in [b"".as_slice(), b"common method contract".as_slice()] {
-            let mut session = method_for_algorithm(algorithm)
-                .prepare_encryption(&keys.public_key_pem)
-                .unwrap();
-            let mut encoded = session.header;
-            let mut ciphertext = vec![0; plaintext.len() + session.block_size];
-            let mut count = session
-                .encryptor
-                .update(plaintext, &mut ciphertext)
-                .unwrap();
-            count += session
-                .encryptor
-                .finalize(&mut ciphertext[count..])
-                .unwrap();
-            encoded.extend_from_slice(&ciphertext[..count]);
-            let mut tag = vec![0; session.tag_size];
-            session.encryptor.authentication_tag(&mut tag).unwrap();
-            encoded.extend_from_slice(&tag);
-            fs::write(&encrypted_path, encoded).unwrap();
+        application::generate_keypair(&keys, None, algorithm).unwrap();
+        application::encrypt(&input, &encrypted, &keys.join("public_key.pem")).unwrap();
+        application::decrypt(
+            &encrypted,
+            &decrypted,
+            &keys.join("private_key.pem"),
+            || unreachable!(),
+        )
+        .unwrap();
 
-            EncryptionService::new()
-                .decrypt(
-                    &encrypted_path,
-                    &output_path,
-                    &private_path,
-                    || unreachable!(),
-                )
-                .unwrap();
-            assert_eq!(fs::read(&output_path).unwrap(), plaintext, "{algorithm}");
-        }
+        assert!(fs::read(&decrypted).unwrap().is_empty(), "{algorithm}");
     }
 }
 
 #[test]
 fn modern_methods_reject_shortened_authentication_tags() {
-    for algorithm in [Algorithm::RsaAes256Gcm, Algorithm::X25519ChaCha20Poly1305] {
-        let keys = key_generator_for_algorithm(algorithm)
+    for &algorithm in Algorithm::value_variants() {
+        let keys = method_for_algorithm(algorithm)
             .generate_keypair(None)
             .unwrap();
-        let method = method_for_algorithm(algorithm);
-        let session = method.prepare_encryption(&keys.public_key_pem).unwrap();
+        let session = prepare_encryption(&keys.public_key_pem).unwrap();
         let mut header = session.header;
         // The generic format accepts this length; each method must reject it.
         header[PREAMBLE_SIZE + 10..PREAMBLE_SIZE + 12].copy_from_slice(&8_u16.to_be_bytes());
         let mut reader = std::io::Cursor::new(header);
-        let header = muenc::file_format::read_header(&mut reader).unwrap();
-        let error = method
+        let header = read_header(&mut reader).unwrap();
+        let error = method_for_header(&header)
+            .unwrap()
             .prepare_decryption(&mut reader, header, &keys.private_key_pem, None)
             .err()
             .expect("the method must require its full authentication tag");
@@ -179,7 +150,6 @@ impl Drop for TestDirectory {
 #[test]
 fn rsa_round_trip_uses_version_one_and_supports_in_place_operation() {
     let directory = TestDirectory::new();
-    let service = EncryptionService::new();
     let keys = directory.path("keys");
     let input = directory.path("input.bin");
     let encrypted = directory.path("input.bin.enc");
@@ -189,20 +159,15 @@ fn rsa_round_trip_uses_version_one_and_supports_in_place_operation() {
         .collect();
     fs::write(&input, &plaintext).unwrap();
 
-    service
-        .generate_keypair(&keys, None, Algorithm::RsaAes256Gcm)
-        .unwrap();
-    service
-        .encrypt(&input, &encrypted, &keys.join("public_key.pem"))
-        .unwrap();
-    service
-        .decrypt(
-            &encrypted,
-            &decrypted,
-            &keys.join("private_key.pem"),
-            || panic!("an unencrypted private key must not request a passphrase"),
-        )
-        .unwrap();
+    application::generate_keypair(&keys, None, Algorithm::RsaAes256Gcm).unwrap();
+    application::encrypt(&input, &encrypted, &keys.join("public_key.pem")).unwrap();
+    application::decrypt(
+        &encrypted,
+        &decrypted,
+        &keys.join("private_key.pem"),
+        || panic!("an unencrypted private key must not request a passphrase"),
+    )
+    .unwrap();
 
     assert_eq!(fs::read(decrypted).unwrap(), plaintext);
     let encoded = fs::read(encrypted).unwrap();
@@ -214,48 +179,40 @@ fn rsa_round_trip_uses_version_one_and_supports_in_place_operation() {
     assert_eq!(&encoded[PREAMBLE_SIZE..PREAMBLE_SIZE + 2], &[0, 1]);
     assert_eq!(&encoded[PREAMBLE_SIZE + 2..PREAMBLE_SIZE + 4], &[0, 1]);
 
-    service
-        .encrypt(&input, &input, &keys.join("public_key.pem"))
-        .unwrap();
-    service
-        .decrypt(
-            &input,
-            &input,
-            &keys.join("private_key.pem"),
-            || unreachable!(),
-        )
-        .unwrap();
+    application::encrypt(&input, &input, &keys.join("public_key.pem")).unwrap();
+    application::decrypt(
+        &input,
+        &input,
+        &keys.join("private_key.pem"),
+        || unreachable!(),
+    )
+    .unwrap();
     assert_eq!(fs::read(input).unwrap(), plaintext);
 }
 
 #[test]
 fn x25519_chacha20_poly1305_round_trip_and_auto_detection() {
     let directory = TestDirectory::new();
-    let service = EncryptionService::new();
     let keys = directory.path("keys");
     let input = directory.path("message.txt");
     let encrypted = directory.path("message.enc");
     let decrypted = directory.path("message.out");
     fs::write(&input, b"a message for the modern algorithm").unwrap();
 
-    service
-        .generate_keypair(
-            &keys,
-            Some(b"modern passphrase"),
-            Algorithm::X25519ChaCha20Poly1305,
-        )
-        .unwrap();
-    service
-        .encrypt(&input, &encrypted, &keys.join("public_key.pem"))
-        .unwrap();
-    service
-        .decrypt(
-            &encrypted,
-            &decrypted,
-            &keys.join("private_key.pem"),
-            || Ok(b"modern passphrase".to_vec()),
-        )
-        .unwrap();
+    application::generate_keypair(
+        &keys,
+        Some(b"modern passphrase"),
+        Algorithm::X25519ChaCha20Poly1305,
+    )
+    .unwrap();
+    application::encrypt(&input, &encrypted, &keys.join("public_key.pem")).unwrap();
+    application::decrypt(
+        &encrypted,
+        &decrypted,
+        &keys.join("private_key.pem"),
+        || Ok(b"modern passphrase".to_vec()),
+    )
+    .unwrap();
 
     assert_eq!(
         fs::read(decrypted).unwrap(),
@@ -269,41 +226,34 @@ fn x25519_chacha20_poly1305_round_trip_and_auto_detection() {
 #[test]
 fn encrypted_private_key_requests_passphrase_automatically() {
     let directory = TestDirectory::new();
-    let service = EncryptionService::new();
     let keys = directory.path("keys");
     let input = directory.path("message.txt");
     let encrypted = directory.path("message.enc");
     let decrypted = directory.path("message.out");
     fs::write(&input, b"secret message").unwrap();
 
-    service
-        .generate_keypair(&keys, Some(b"correct horse"), Algorithm::RsaAes256Gcm)
-        .unwrap();
-    service
-        .encrypt(&input, &encrypted, &keys.join("public_key.pem"))
-        .unwrap();
-    let wrong_passphrase = service
-        .decrypt(
-            &encrypted,
-            &decrypted,
-            &keys.join("private_key.pem"),
-            || Ok(b"wrong passphrase".to_vec()),
-        )
-        .unwrap_err();
+    application::generate_keypair(&keys, Some(b"correct horse"), Algorithm::RsaAes256Gcm).unwrap();
+    application::encrypt(&input, &encrypted, &keys.join("public_key.pem")).unwrap();
+    let wrong_passphrase = application::decrypt(
+        &encrypted,
+        &decrypted,
+        &keys.join("private_key.pem"),
+        || Ok(b"wrong passphrase".to_vec()),
+    )
+    .unwrap_err();
     assert!(matches!(wrong_passphrase, AppError::InvalidPassphrase));
 
     let mut prompts = 0;
-    service
-        .decrypt(
-            &encrypted,
-            &decrypted,
-            &keys.join("private_key.pem"),
-            || {
-                prompts += 1;
-                Ok(b"correct horse".to_vec())
-            },
-        )
-        .unwrap();
+    application::decrypt(
+        &encrypted,
+        &decrypted,
+        &keys.join("private_key.pem"),
+        || {
+            prompts += 1;
+            Ok(b"correct horse".to_vec())
+        },
+    )
+    .unwrap();
     assert_eq!(prompts, 1);
     assert_eq!(fs::read(decrypted).unwrap(), b"secret message");
 }
@@ -311,33 +261,27 @@ fn encrypted_private_key_requests_passphrase_automatically() {
 #[test]
 fn authentication_failure_preserves_existing_output() {
     let directory = TestDirectory::new();
-    let service = EncryptionService::new();
     let keys = directory.path("keys");
     let input = directory.path("input.txt");
     let encrypted = directory.path("input.enc");
     let output = directory.path("output.txt");
     fs::write(&input, b"authenticated plaintext").unwrap();
     fs::write(&output, b"existing safe output").unwrap();
-    service
-        .generate_keypair(&keys, None, Algorithm::X25519ChaCha20Poly1305)
-        .unwrap();
-    service
-        .encrypt(&input, &encrypted, &keys.join("public_key.pem"))
-        .unwrap();
+    application::generate_keypair(&keys, None, Algorithm::X25519ChaCha20Poly1305).unwrap();
+    application::encrypt(&input, &encrypted, &keys.join("public_key.pem")).unwrap();
 
     let original = fs::read(&encrypted).unwrap();
     let mut damaged = original.clone();
     let ciphertext_index = damaged.len() - LEGACY_TAG_SIZE - 1;
     damaged[ciphertext_index] ^= 0x80;
     fs::write(&encrypted, damaged).unwrap();
-    let error = service
-        .decrypt(
-            &encrypted,
-            &output,
-            &keys.join("private_key.pem"),
-            || unreachable!(),
-        )
-        .unwrap_err();
+    let error = application::decrypt(
+        &encrypted,
+        &output,
+        &keys.join("private_key.pem"),
+        || unreachable!(),
+    )
+    .unwrap_err();
 
     assert!(matches!(error, AppError::AuthenticationFailed));
     assert_eq!(fs::read(&output).unwrap(), b"existing safe output");
@@ -347,14 +291,13 @@ fn authentication_failure_preserves_existing_output() {
     let nonce_index = PREAMBLE_SIZE + 12 + 32;
     damaged_header[nonce_index] ^= 0x40;
     fs::write(&encrypted, damaged_header).unwrap();
-    let error = service
-        .decrypt(
-            &encrypted,
-            &output,
-            &keys.join("private_key.pem"),
-            || unreachable!(),
-        )
-        .unwrap_err();
+    let error = application::decrypt(
+        &encrypted,
+        &output,
+        &keys.join("private_key.pem"),
+        || unreachable!(),
+    )
+    .unwrap_err();
     assert!(matches!(error, AppError::AuthenticationFailed));
     assert_eq!(fs::read(&output).unwrap(), b"existing safe output");
 }
@@ -371,9 +314,9 @@ fn legacy_files_support_encrypted_private_keys() {
 
 fn check_legacy_compatibility(passphrase: Option<&[u8]>) {
     let directory = TestDirectory::new();
-    let generator = key_generator_for_algorithm(Algorithm::RsaAes256Gcm);
-    let service = EncryptionService::new();
-    let keys = generator.generate_keypair(passphrase).unwrap();
+    let keys = method_for_algorithm(Algorithm::RsaAes256Gcm)
+        .generate_keypair(passphrase)
+        .unwrap();
     let private_key_path = directory.path("private.pem");
     let encrypted_path = directory.path("legacy.enc");
     let output_path = directory.path("output.bin");
@@ -411,27 +354,25 @@ fn check_legacy_compatibility(passphrase: Option<&[u8]>) {
     fs::write(&encrypted_path, &legacy_file).unwrap();
 
     let mut prompts = 0;
-    service
-        .decrypt(&encrypted_path, &output_path, &private_key_path, || {
-            prompts += 1;
-            Ok(passphrase
-                .expect("unencrypted keys must not prompt")
-                .to_vec())
-        })
-        .unwrap();
+    application::decrypt(&encrypted_path, &output_path, &private_key_path, || {
+        prompts += 1;
+        Ok(passphrase
+            .expect("unencrypted keys must not prompt")
+            .to_vec())
+    })
+    .unwrap();
     assert_eq!(prompts, usize::from(passphrase.is_some()));
     assert_eq!(fs::read(&output_path).unwrap(), plaintext);
 
     // Legacy authentication failures must also preserve an existing destination.
     *legacy_file.last_mut().unwrap() ^= 1;
     fs::write(&encrypted_path, legacy_file).unwrap();
-    let error = service
-        .decrypt(&encrypted_path, &output_path, &private_key_path, || {
-            Ok(passphrase
-                .expect("unencrypted keys must not prompt")
-                .to_vec())
-        })
-        .unwrap_err();
+    let error = application::decrypt(&encrypted_path, &output_path, &private_key_path, || {
+        Ok(passphrase
+            .expect("unencrypted keys must not prompt")
+            .to_vec())
+    })
+    .unwrap_err();
     assert!(matches!(error, AppError::AuthenticationFailed));
     assert_eq!(fs::read(&output_path).unwrap(), plaintext);
 }

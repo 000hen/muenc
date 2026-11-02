@@ -5,11 +5,11 @@ use crate::{
     file_format::{self, VersionedHeader},
 };
 
-use super::{AlgorithmDetails, Encapsulation, StreamDecryptor, StreamEncryptor, openssl_stream};
+use super::{AlgorithmDetails, Encapsulation, StreamDecryptor, StreamEncryptor, TAG_SIZE};
 
 pub struct EncryptionSession {
     pub header: Vec<u8>,
-    pub encryptor: Box<dyn StreamEncryptor>,
+    pub encryptor: StreamEncryptor,
     pub block_size: usize,
     pub tag_size: usize,
 }
@@ -24,32 +24,25 @@ impl EncryptionSession {
         let mut nonce = vec![0; nonce_size];
         rand::rand_bytes(&mut nonce)
             .map_err(|error| AppError::crypto("generating the encryption nonce", error))?;
-        let mut header = Vec::new();
-        file_format::write_versioned_header(
-            &mut header,
+        let header = file_format::encode_versioned_header(
             details,
             &encapsulation.key_material,
             &nonce,
-            16,
-        )?;
-        let mut encryptor = openssl_stream::encryptor(
-            cipher,
-            &encapsulation.data_key,
-            &nonce,
-            "initializing file encryption",
-        )?;
+            TAG_SIZE,
+        );
+        let mut encryptor = StreamEncryptor::new(cipher, &encapsulation.data_key, &nonce)?;
         encryptor.authenticate_header(&header)?;
         Ok(Self {
             header,
             encryptor,
             block_size: cipher.block_size(),
-            tag_size: 16,
+            tag_size: TAG_SIZE,
         })
     }
 }
 
 pub struct DecryptionSession {
-    pub decryptor: Box<dyn StreamDecryptor>,
+    pub decryptor: StreamDecryptor,
     pub block_size: usize,
     pub tag_size: usize,
     pub header_size: usize,
@@ -61,18 +54,13 @@ impl DecryptionSession {
         header: VersionedHeader,
         data_key: &[u8],
     ) -> Result<Self> {
-        let mut decryptor = openssl_stream::decryptor(
-            cipher,
-            data_key,
-            &header.nonce,
-            "initializing file decryption",
-        )?;
+        let mut decryptor = StreamDecryptor::new(cipher, data_key, &header.nonce)?;
         decryptor.authenticate_header(&header.authenticated_bytes)?;
         Ok(Self {
             decryptor,
             block_size: cipher.block_size(),
             tag_size: header.tag_size,
-            header_size: header.encoded_size(),
+            header_size: header.authenticated_bytes.len(),
         })
     }
 }
